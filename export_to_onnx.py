@@ -49,12 +49,7 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=1,
-        help="Dummy batch size used for tracing. Batch remains dynamic in ONNX.",
-    )
-    parser.add_argument(
-        "--no-dynamic-axes",
-        action="store_true",
-        help="Disable dynamic batch axes.",
+        help="Batch size used for tracing and for the exported ONNX graph.",
     )
     parser.add_argument(
         "--no-check",
@@ -135,6 +130,7 @@ def export_onnx(
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             dynamo=True,
+            external_data=False,
         )
 
 
@@ -178,11 +174,7 @@ def main() -> int:
         dtype=torch.float32,
         device=device,
     )
-    batch_dynamic = None
     encoder_dynamic = None
-    if not args.no_dynamic_axes:
-        batch_dynamic = {0: "batch"}
-        encoder_dynamic = {"mel": batch_dynamic, "audio_features": batch_dynamic}
 
     exported: list[Path] = []
     print(f"Output directory: {output_dir}")

@@ -58,12 +58,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip ONNX shape inference before saving.",
     )
-    parser.add_argument(
-        "--external-data-threshold",
-        type=int,
-        default=1024,
-        help="Tensor size threshold in bytes for external data when saving. Default: 1024",
-    )
     return parser.parse_args()
 
 
@@ -91,6 +85,43 @@ def initializer_array(initializers: dict[str, TensorProto], name: str):
     if name not in initializers:
         raise OptimizationError(f"Missing initializer: {name}")
     return numpy_helper.to_array(initializers[name])
+
+
+def resolve_shape_values(
+    name: str,
+    producers: dict[str, onnx.NodeProto],
+    initializers: dict[str, TensorProto],
+) -> list[int | None]:
+    if name in initializers:
+        return [
+            int(value)
+            for value in numpy_helper.to_array(initializers[name]).reshape(-1)
+        ]
+
+    producer = producers.get(name)
+    if producer is None:
+        raise OptimizationError(f"Cannot resolve shape tensor: {name}")
+
+    if producer.op_type == "Constant":
+        for attr in producer.attribute:
+            if attr.name == "value":
+                return [
+                    int(value) for value in numpy_helper.to_array(attr.t).reshape(-1)
+                ]
+        raise OptimizationError(f"Constant node has no tensor value: {producer.name}")
+
+    if producer.op_type == "Shape":
+        return [None]
+
+    if producer.op_type == "Concat":
+        values: list[int | None] = []
+        for input_name in producer.input:
+            values.extend(resolve_shape_values(input_name, producers, initializers))
+        return values
+
+    raise OptimizationError(
+        f"Unsupported shape producer for {name}: {producer.op_type} ({producer.name})"
+    )
 
 
 def require_single_consumer(
@@ -166,8 +197,10 @@ def match_attention_layout(
         if len(reshape.input) < 2:
             return None
 
-        shape = initializer_array(initializers, reshape.input[1]).tolist()
+        shape = resolve_shape_values(reshape.input[1], producers, initializers)
         if len(shape) != 4:
+            return None
+        if shape[2] is None:
             return None
         current_num_heads = int(shape[2])
         if current_num_heads <= 0:
@@ -194,7 +227,7 @@ def match_attention_layout(
         return None
     if len(post_reshape.input) < 2:
         return None
-    output_shape = initializer_array(initializers, post_reshape.input[1]).tolist()
+    output_shape = resolve_shape_values(post_reshape.input[1], producers, initializers)
     if len(output_shape) != 3:
         return None
 
@@ -236,17 +269,9 @@ def rewrite_attention_to_3d(model: onnx.ModelProto) -> int:
     return rewritten
 
 
-def save_model(model: onnx.ModelProto, output_path: Path, threshold: int) -> None:
+def save_model(model: onnx.ModelProto, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    onnx.save_model(
-        model,
-        str(output_path),
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=f"{output_path.name}.data",
-        size_threshold=threshold,
-        convert_attribute=False,
-    )
+    onnx.save_model(model, str(output_path), save_as_external_data=False)
 
 
 def main() -> int:
@@ -267,7 +292,7 @@ def main() -> int:
     if not args.no_check:
         onnx.checker.check_model(model)
 
-    save_model(model, args.output, args.external_data_threshold)
+    save_model(model, args.output)
     print(f"Input: {args.input}")
     print(f"Output: {args.output}")
     print(f"Rewritten Attention nodes: {rewritten}")
