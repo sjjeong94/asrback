@@ -6,7 +6,9 @@ Examples:
     conda run -n whisper python export_to_onnx.py --model tiny
 
 This exports Whisper's encoder graph. Whisper's encoder expects a fixed
-30-second log-Mel input.
+30-second log-Mel input. The exported graph also computes decoder cross-attention
+key/value projections from the encoder features so they can be reused by decoder
+cross-attention.
 """
 
 from __future__ import annotations
@@ -107,6 +109,34 @@ def require_positive(name: str, value: int) -> None:
         raise ValueError(f"{name} must be greater than zero")
 
 
+def create_encoder_with_cross_attention_kv(torch, model):
+    class EncoderWithCrossAttentionKV(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = model.encoder
+            self.cross_attn_layers = torch.nn.ModuleList(
+                block.cross_attn for block in model.decoder.blocks
+            )
+
+        def forward(self, mel):
+            audio_features = self.encoder(mel)
+            outputs = [audio_features]
+            for cross_attn in self.cross_attn_layers:
+                outputs.append(cross_attn.key(audio_features))
+                outputs.append(cross_attn.value(audio_features))
+            return tuple(outputs)
+
+    return EncoderWithCrossAttentionKV()
+
+
+def encoder_output_names(num_decoder_blocks: int) -> list[str]:
+    output_names = ["audio_features"]
+    for index in range(num_decoder_blocks):
+        output_names.append(f"cross_attn_k_{index}")
+        output_names.append(f"cross_attn_v_{index}")
+    return output_names
+
+
 def export_onnx(
     torch,
     module,
@@ -182,13 +212,16 @@ def main() -> int:
 
     encoder_path = output_dir / "encoder.onnx"
     print(f"Exporting encoder: {encoder_path}")
+    encoder_module = create_encoder_with_cross_attention_kv(torch, model)
+    encoder_module.eval()
+    encoder_outputs = encoder_output_names(len(model.decoder.blocks))
     export_onnx(
         torch=torch,
-        module=model.encoder,
+        module=encoder_module,
         inputs=(mel,),
         output_path=encoder_path,
         input_names=["mel"],
-        output_names=["audio_features"],
+        output_names=encoder_outputs,
         dynamic_axes=encoder_dynamic,
         opset=args.opset,
     )

@@ -14,6 +14,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from types import MethodType
 
 from evaluate import (
     DEFAULT_DATASET,
@@ -167,26 +168,85 @@ def select_providers(ort, provider: str, decoder_device: str) -> list[str]:
     return providers
 
 
-def create_onnx_audio_encoder(torch, session, output_device):
+def create_onnx_audio_encoder(torch, session, model, output_device):
     class OnnxAudioEncoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.session = session
             self.input_name = session.get_inputs()[0].name
-            self.output_name = session.get_outputs()[0].name
+            self.output_names = [output.name for output in session.get_outputs()]
+            self.audio_output_name = self.output_names[0]
+            self.cross_kv_output_names = self._match_cross_kv_outputs()
+            self.cross_kv_cache = {}
+
+        def _match_cross_kv_outputs(self):
+            output_names = set(self.output_names)
+            matched = []
+            for index, block in enumerate(model.decoder.blocks):
+                key_name = f"cross_attn_k_{index}"
+                value_name = f"cross_attn_v_{index}"
+                if key_name in output_names and value_name in output_names:
+                    matched.append((key_name, block.cross_attn.key))
+                    matched.append((value_name, block.cross_attn.value))
+            return matched
 
         def forward(self, mel):
             input_array = mel.detach().to("cpu", dtype=torch.float32).numpy()
-            output_array = self.session.run(
-                [self.output_name],
+            requested_outputs = [self.audio_output_name] + [
+                name for name, _ in self.cross_kv_output_names
+            ]
+            output_arrays = self.session.run(
+                requested_outputs,
                 {self.input_name: input_array},
-            )[0]
-            return torch.from_numpy(output_array).to(
+            )
+            audio_features = torch.from_numpy(output_arrays[0]).to(
                 device=output_device,
                 dtype=mel.dtype,
             )
+            self.cross_kv_cache = {
+                module: torch.from_numpy(output_array).to(
+                    device=output_device,
+                    dtype=mel.dtype,
+                )
+                for (_, module), output_array in zip(
+                    self.cross_kv_output_names, output_arrays[1:]
+                )
+            }
+            return audio_features
 
     return OnnxAudioEncoder()
+
+
+def install_cross_kv_cache_seed(model, onnx_encoder) -> None:
+    original_install_kv_cache_hooks = model.install_kv_cache_hooks
+
+    def install_kv_cache_hooks_with_cross_kv(self, cache=None):
+        seeded_cache = dict(cache or {})
+        seeded_cache.update(onnx_encoder.cross_kv_cache)
+        return original_install_kv_cache_hooks(seeded_cache)
+
+    def decoder_forward_with_self_cache_offset(self, x, xa, kv_cache=None):
+        first_self_key = self.blocks[0].attn.key
+        offset = kv_cache[first_self_key].shape[1] if first_self_key in kv_cache else 0
+        x = (
+            self.token_embedding(x)
+            + self.positional_embedding[offset : offset + x.shape[-1]]
+        )
+        x = x.to(xa.dtype)
+
+        for block in self.blocks:
+            x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+
+        x = self.ln(x)
+        logits = (x @ self.token_embedding.weight.to(x.dtype).transpose(0, 1)).float()
+        return logits
+
+    model.install_kv_cache_hooks = MethodType(
+        install_kv_cache_hooks_with_cross_kv, model
+    )
+    model.decoder.forward = MethodType(
+        decoder_forward_with_self_cache_offset, model.decoder
+    )
 
 
 def main() -> int:
@@ -223,7 +283,14 @@ def main() -> int:
 
     session = ort.InferenceSession(str(args.encoder), providers=providers)
     model = whisper.load_model(args.model, device=device)
-    model.encoder = create_onnx_audio_encoder(torch, session, torch.device(device))
+    onnx_encoder = create_onnx_audio_encoder(
+        torch, session, model, torch.device(device)
+    )
+    model.encoder = onnx_encoder
+    install_cross_kv_cache_seed(model, onnx_encoder)
+    print(f"Encoder outputs: {onnx_encoder.output_names}")
+    print(f"Cross-attention KV outputs: {len(onnx_encoder.cross_kv_output_names)}")
+    sys.stdout.flush()
 
     predictions: list[dict[str, str]] = []
     normalized_references: list[str] = []
