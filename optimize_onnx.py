@@ -21,6 +21,8 @@ import argparse
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
+
 import onnx
 from onnx import TensorProto, helper, numpy_helper, shape_inference
 
@@ -79,6 +81,34 @@ def get_consumer_map(graph) -> dict[str, list[onnx.NodeProto]]:
         for input_name in node.input:
             consumers.setdefault(input_name, []).append(node)
     return consumers
+
+
+def collect_names(graph) -> set[str]:
+    names: set[str] = set()
+    for value in graph.input:
+        names.add(value.name)
+    for value in graph.output:
+        names.add(value.name)
+    for value in graph.value_info:
+        names.add(value.name)
+    for initializer in graph.initializer:
+        names.add(initializer.name)
+    for node in graph.node:
+        if node.name:
+            names.add(node.name)
+        names.update(name for name in node.input if name)
+        names.update(name for name in node.output if name)
+    return names
+
+
+def make_unique_name(existing: set[str], base: str) -> str:
+    candidate = base
+    suffix = 0
+    while candidate in existing:
+        suffix += 1
+        candidate = f"{base}_{suffix}"
+    existing.add(candidate)
+    return candidate
 
 
 def initializer_array(initializers: dict[str, TensorProto], name: str):
@@ -269,6 +299,63 @@ def rewrite_attention_to_3d(model: onnx.ModelProto) -> int:
     return rewritten
 
 
+def decompose_conv_bias(model: onnx.ModelProto) -> int:
+    graph = model.graph
+    initializers = get_initializer_map(graph)
+    existing_names = collect_names(graph)
+    new_nodes: list[onnx.NodeProto] = []
+    decomposed = 0
+
+    for node in graph.node:
+        new_nodes.append(node)
+        if node.op_type != "Conv" or len(node.input) < 3 or not node.input[2]:
+            continue
+
+        bias_name = node.input[2]
+        weight_name = node.input[1]
+        if bias_name not in initializers or weight_name not in initializers:
+            continue
+
+        weight = initializer_array(initializers, weight_name)
+        bias = initializer_array(initializers, bias_name)
+        if weight.ndim < 3 or bias.ndim != 1 or bias.shape[0] != weight.shape[0]:
+            continue
+
+        original_output = node.output[0]
+        conv_output = make_unique_name(existing_names, f"{original_output}_conv")
+        reshaped_bias_name = make_unique_name(
+            existing_names, f"{bias_name}_conv_add_bias"
+        )
+        add_name = make_unique_name(
+            existing_names, f"{node.name or original_output}_bias_add"
+        )
+
+        bias_shape = (1, bias.shape[0], *([1] * (weight.ndim - 2)))
+        reshaped_bias = bias.reshape(bias_shape).astype(bias.dtype, copy=False)
+        graph.initializer.append(
+            numpy_helper.from_array(
+                np.ascontiguousarray(reshaped_bias), name=reshaped_bias_name
+            )
+        )
+
+        del node.input[2:]
+        node.output[0] = conv_output
+        new_nodes.append(
+            helper.make_node(
+                "Add",
+                inputs=[conv_output, reshaped_bias_name],
+                outputs=[original_output],
+                name=add_name,
+            )
+        )
+        decomposed += 1
+
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+    remove_unused_initializers(graph)
+    return decomposed
+
+
 def save_model(model: onnx.ModelProto, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     onnx.save_model(model, str(output_path), save_as_external_data=False)
@@ -285,6 +372,7 @@ def main() -> int:
         raise OptimizationError(
             "No Attention reshape/transpose patterns were rewritten"
         )
+    decomposed = decompose_conv_bias(model)
 
     if not args.no_shape_inference:
         model = shape_inference.infer_shapes(model)
@@ -296,6 +384,7 @@ def main() -> int:
     print(f"Input: {args.input}")
     print(f"Output: {args.output}")
     print(f"Rewritten Attention nodes: {rewritten}")
+    print(f"Decomposed Conv bias nodes: {decomposed}")
     return 0
 
 

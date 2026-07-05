@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Quantize MatMul weights in an ONNX model with per-column absmax scales.
+"""Quantize MatMul and Conv1d weights in an ONNX model with absmax scales.
 
 For a MatMul weight W with shape KxN, this pass computes one scale per output
 column N:
 
     scale[n] = max(abs(W[:, n])) / qmax
     Wq[:, n] = round(W[:, n] / scale[n])
+
+For a Conv1d weight W with shape NxCxS, this pass computes one scale per output
+channel N and stores it with shape 1xNx1 for output broadcasting.
 
 The graph is rewritten from:
 
@@ -16,9 +19,9 @@ to:
     Yq = MatMul(X, Wq)
     Y  = Mul(Yq, scale)
 
-Wq is stored as a float tensor containing integer-valued quantized weights so
-that the graph remains valid with floating-point activations and standard ONNX
-MatMul type constraints.
+Conv1d nodes are rewritten with the same post-op Mul pattern. Wq is stored as a
+float tensor containing integer-valued quantized weights so that the graph
+remains valid with floating-point activations and standard ONNX type constraints.
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ class QuantizationError(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Quantize ONNX MatMul weights with per-column absmax scales."
+        description="Quantize ONNX MatMul and Conv1d weights with absmax scales."
     )
     parser.add_argument(
         "--input",
@@ -115,7 +118,7 @@ def collect_names(graph) -> set[str]:
     return names
 
 
-def quantize_weight_absmax(
+def quantize_matmul_weight_absmax(
     weight: np.ndarray, bits: int
 ) -> tuple[np.ndarray, np.ndarray]:
     if weight.ndim != 2:
@@ -131,6 +134,24 @@ def quantize_weight_absmax(
     quantized = np.round(weight_f32 / scale.reshape(1, -1))
     quantized = np.clip(quantized, -qmax, qmax).astype(np.float32)
     return quantized, scale
+
+
+def quantize_conv1d_weight_absmax(
+    weight: np.ndarray, bits: int
+) -> tuple[np.ndarray, np.ndarray]:
+    if weight.ndim != 3:
+        raise QuantizationError(f"Expected 3D Conv1d weight, got shape {weight.shape}")
+    if bits < 2:
+        raise QuantizationError("--bits must be at least 2")
+
+    qmax = float((1 << (bits - 1)) - 1)
+    weight_f32 = weight.astype(np.float32, copy=False)
+    absmax = np.max(np.abs(weight_f32), axis=(1, 2))
+    scale = absmax / qmax
+    scale = np.where(scale == 0.0, 1.0, scale).astype(np.float32)
+    quantized = np.round(weight_f32 / scale.reshape(-1, 1, 1))
+    quantized = np.clip(quantized, -qmax, qmax).astype(np.float32)
+    return quantized, scale.reshape(1, -1, 1)
 
 
 def quantize_matmul_weights(model: onnx.ModelProto, bits: int) -> int:
@@ -154,7 +175,61 @@ def quantize_matmul_weights(model: onnx.ModelProto, bits: int) -> int:
         if weight.ndim != 2 or not np.issubdtype(weight.dtype, np.floating):
             continue
 
-        quantized, scale = quantize_weight_absmax(weight, bits)
+        quantized, scale = quantize_matmul_weight_absmax(weight, bits)
+        if weight_name not in quantized_initializers:
+            replace_initializer(graph, weight_name, quantized)
+            quantized_initializers.add(weight_name)
+
+        original_output = node.output[0]
+        quantized_output = make_unique_name(
+            existing_names, f"{original_output}_quantized"
+        )
+        scale_name = make_unique_name(existing_names, f"{weight_name}_absmax_scale")
+        mul_name = make_unique_name(
+            existing_names, f"{node.name or original_output}_absmax_dequant"
+        )
+
+        node.output[0] = quantized_output
+        graph.initializer.append(numpy_helper.from_array(scale, name=scale_name))
+        new_nodes.append(
+            helper.make_node(
+                "Mul",
+                inputs=[quantized_output, scale_name],
+                outputs=[original_output],
+                name=mul_name,
+            )
+        )
+        quantized_count += 1
+
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+    return quantized_count
+
+
+def quantize_conv1d_weights(model: onnx.ModelProto, bits: int) -> int:
+    graph = model.graph
+    initializers = get_initializer_map(graph)
+    existing_names = collect_names(graph)
+    new_nodes: list[onnx.NodeProto] = []
+    quantized_initializers: set[str] = set()
+    quantized_count = 0
+
+    for node in graph.node:
+        new_nodes.append(node)
+        if node.op_type != "Conv" or len(node.input) < 2 or len(node.output) != 1:
+            continue
+        if len(node.input) >= 3 and node.input[2]:
+            continue
+
+        weight_name = node.input[1]
+        if weight_name not in initializers:
+            continue
+
+        weight = numpy_helper.to_array(initializers[weight_name])
+        if weight.ndim != 3 or not np.issubdtype(weight.dtype, np.floating):
+            continue
+
+        quantized, scale = quantize_conv1d_weight_absmax(weight, bits)
         if weight_name not in quantized_initializers:
             replace_initializer(graph, weight_name, quantized)
             quantized_initializers.add(weight_name)
@@ -196,10 +271,11 @@ def main() -> int:
         raise FileNotFoundError(f"Input ONNX model not found: {args.input}")
 
     model = onnx.load(str(args.input))
-    quantized = quantize_matmul_weights(model, args.bits)
-    if quantized == 0:
+    quantized_matmul = quantize_matmul_weights(model, args.bits)
+    quantized_conv1d = quantize_conv1d_weights(model, args.bits)
+    if quantized_matmul + quantized_conv1d == 0:
         raise QuantizationError(
-            "No MatMul nodes with 2D floating-point initializer weights were quantized"
+            "No MatMul or Conv1d nodes with floating-point initializer weights were quantized"
         )
 
     if not args.no_shape_inference:
@@ -211,7 +287,8 @@ def main() -> int:
     save_model(model, args.output)
     print(f"Input: {args.input}")
     print(f"Output: {args.output}")
-    print(f"Quantized MatMul weights: {quantized}")
+    print(f"Quantized MatMul weights: {quantized_matmul}")
+    print(f"Quantized Conv1d weights: {quantized_conv1d}")
     print(f"Bits: {args.bits}")
     return 0
 
