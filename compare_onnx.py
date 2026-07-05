@@ -186,8 +186,16 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a_flat, b_flat) / denom)
 
 
-def print_metrics(output_index: int, metrics: dict[str, object]) -> None:
-    print(f"Output {output_index}:")
+def print_metrics(
+    output_index: int,
+    output_name_a: str,
+    output_name_b: str,
+    metrics: dict[str, object],
+) -> None:
+    if output_name_a == output_name_b:
+        print(f"Output {output_index}: {output_name_a}")
+    else:
+        print(f"Output {output_index}: model_a={output_name_a} model_b={output_name_b}")
     if not metrics.get("same_shape", False):
         print(f"  shape_a: {metrics['shape_a']}")
         print(f"  shape_b: {metrics['shape_b']}")
@@ -228,6 +236,8 @@ def main() -> int:
     session_b = ort.InferenceSession(str(args.model_b), providers=providers)
     outputs_a = run_model(session_a, args.input_name, input_tensor)
     outputs_b = run_model(session_b, args.input_name, input_tensor)
+    output_names_a = [output.name for output in session_a.get_outputs()]
+    output_names_b = [output.name for output in session_b.get_outputs()]
 
     print(f"Model A: {args.model_a}")
     print(f"Model B: {args.model_b}")
@@ -243,9 +253,11 @@ def main() -> int:
         )
 
     all_close = True
-    for index, (output_a, output_b) in enumerate(zip(outputs_a, outputs_b)):
+    for index, (output_a, output_b, output_name_a, output_name_b) in enumerate(
+        zip(outputs_a, outputs_b, output_names_a, output_names_b)
+    ):
         metrics = compute_metrics(output_a, output_b, args.rtol, args.atol)
-        print_metrics(index, metrics)
+        print_metrics(index, output_name_a, output_name_b, metrics)
         all_close = all_close and bool(metrics.get("allclose", False))
 
     print(f"Overall allclose: {all_close}")

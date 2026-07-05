@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Collect activation min/max statistics for MatMul and Conv inputs in an ONNX model.
+"""Collect activation min/max statistics for Conv inputs in an ONNX model.
 
 The default dataset path matches scripts/download_librispeech_test_clean.sh. This
 script is intended for exported Whisper encoder models: it loads audio samples,
 computes Whisper log-mel inputs, runs an augmented ONNX graph, and records min/max
-for every tensor used as the activation input of MatMul and Conv nodes.
+for every tensor used as the activation input of Conv nodes.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class TensorStats:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Calibrate ONNX MatMul/Conv activation inputs with dataset min/max statistics."
+        description="Calibrate ONNX Conv activation inputs with dataset min/max statistics."
     )
     parser.add_argument(
         "--model",
@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         "--quantized-model",
         type=Path,
         default=DEFAULT_QUANTIZED_MODEL,
-        help=f"Output ONNX model with quantized MatMul/Conv inputs. Default: {DEFAULT_QUANTIZED_MODEL}",
+        help=f"Output ONNX model with quantized Conv inputs. Default: {DEFAULT_QUANTIZED_MODEL}",
     )
     parser.add_argument(
         "--bits",
@@ -90,9 +90,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--provider",
-        default="cpu",
+        default="cuda",
         choices=("cpu", "cuda", "tensorrt"),
-        help="ONNX Runtime execution provider. Default: cpu",
+        help="ONNX Runtime execution provider. Default: cuda",
     )
     parser.add_argument(
         "--limit",
@@ -153,7 +153,7 @@ def collect_target_tensors(model: onnx.ModelProto) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
     for node in model.graph.node:
-        if node.op_type not in {"MatMul", "Conv"} or not node.input:
+        if node.op_type != "Conv" or not node.input:
             continue
         tensor_name = node.input[0]
         if not tensor_name or tensor_name in initializers or tensor_name in seen:
@@ -280,7 +280,7 @@ def quantize_model_inputs(
 
     for node in graph.node:
         if (
-            node.op_type in {"MatMul", "Conv"}
+            node.op_type == "Conv"
             and node.input
             and node.output
             and node.input[0] in targets
@@ -422,7 +422,7 @@ def main() -> int:
     model = onnx.load(str(args.model))
     target_tensors = collect_target_tensors(model)
     if not target_tensors:
-        raise RuntimeError("No MatMul or Conv activation input tensors found")
+        raise RuntimeError("No Conv activation input tensors found")
 
     augmented = make_augmented_model(model, target_tensors)
     tmp_model = write_augmented_model(augmented)
@@ -492,7 +492,7 @@ def main() -> int:
 
     print(f"Output: {args.output}")
     print(f"Quantized model: {args.quantized_model}")
-    print(f"Quantized MatMul/Conv input uses: {quantized_inputs}")
+    print(f"Quantized Conv input uses: {quantized_inputs}")
     for row in rows:
         print(
             f"{row['tensor']}: min={row['min']} max={row['max']} samples={row['samples']}"
