@@ -18,10 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-
 import onnx
-from evaluate import DEFAULT_DATASET, load_samples
 from onnx import TensorProto, helper, shape_inference
+
+from evaluate import DEFAULT_DATASET, load_samples
 
 DEFAULT_MODEL = Path("onnx/tiny/encoder_quantized.onnx")
 DEFAULT_OUTPUT = Path("onnx/tiny/calibration_minmax.json")

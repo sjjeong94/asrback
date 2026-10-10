@@ -9,8 +9,8 @@ import math
 import re
 from pathlib import Path
 
+import asrfront
 import librosa
-import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
@@ -18,7 +18,6 @@ from tokenizers import Tokenizer
 from torch import Tensor, nn
 
 SAMPLE_RATE = 16_000
-N_SAMPLES = SAMPLE_RATE * 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -254,26 +253,7 @@ class WhisperForConditionalGeneration(nn.Module):
 
 def load_audio(path: Path, mel_bins: int) -> Tensor:
     audio, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True)
-    audio = librosa.util.fix_length(audio, size=N_SAMPLES)
-    mel = librosa.feature.melspectrogram(
-        y=audio,
-        sr=SAMPLE_RATE,
-        n_fft=400,
-        hop_length=160,
-        win_length=400,
-        window="hann",
-        center=True,
-        pad_mode="reflect",
-        power=2.0,
-        n_mels=mel_bins,
-        fmin=0.0,
-        fmax=8000.0,
-        htk=False,
-        norm="slaney",
-    )[:, :-1]
-    log_mel = np.log10(np.maximum(mel, 1e-10))
-    log_mel = np.maximum(log_mel, log_mel.max() - 8.0)
-    log_mel = (log_mel + 4.0) / 4.0
+    log_mel = asrfront.whisper.log_mel(audio, n_mels=mel_bins)
     return torch.from_numpy(log_mel).float().unsqueeze(0)
 
 

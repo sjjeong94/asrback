@@ -1,0 +1,35 @@
+[project]
+name = "whisper"
+version = "0.1.0"
+description = "Whisper inference, ONNX export, optimization, and quantization tools"
+requires-python = ">=3.10"
+dependencies = [
+    "asrfront>=0.1.0",
+    "huggingface-hub",
+    "librosa",
+    "numpy",
+    "onnx",
+    "onnxruntime",
+    "openai-whisper",
+    "safetensors",
+    "tokenizers",
+    "torch",
+]
+
+[dependency-groups]
+dev = [
+    "black",
+    "flake8",
+    "isort",
+    "pre-commit",
+]
+
+[tool.uv]
+package = false
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+line_length = 88

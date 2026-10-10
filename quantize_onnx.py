@@ -30,7 +30,6 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-
 import onnx
 from onnx import TensorProto, helper, numpy_helper, shape_inference
 

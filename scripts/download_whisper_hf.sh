@@ -19,6 +19,11 @@ download_model() {
   local model="$1"
   local repo="openai/whisper-$model"
   local output_dir="$MODEL_DIR/whisper-$model"
+  local include_args=()
+  local pattern
+  for pattern in "${INCLUDE_PATTERNS[@]}"; do
+    include_args+=(--include "$pattern")
+  done
 
   case "$model" in
     tiny|base|small) ;;
@@ -35,20 +40,20 @@ download_model() {
     hf download "$repo" \
       --revision "$REVISION" \
       --local-dir "$output_dir" \
-      --include "${INCLUDE_PATTERNS[@]}"
+      "${include_args[@]}"
   elif command -v huggingface-cli >/dev/null 2>&1; then
     huggingface-cli download "$repo" \
       --revision "$REVISION" \
       --local-dir "$output_dir" \
-      --include "${INCLUDE_PATTERNS[@]}"
+      "${include_args[@]}"
   elif python3 -c 'import huggingface_hub' >/dev/null 2>&1; then
     python3 -m huggingface_hub.commands.huggingface_cli download "$repo" \
       --revision "$REVISION" \
       --local-dir "$output_dir" \
-      --include "${INCLUDE_PATTERNS[@]}"
+      "${include_args[@]}"
   else
     echo "Error: Hugging Face Hub is not installed." >&2
-    echo "Install it with: python3 -m pip install -U huggingface_hub" >&2
+    echo "Install it with: uv sync (then run via: uv run $0)" >&2
     return 1
   fi
 
