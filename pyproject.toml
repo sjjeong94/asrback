@@ -4,9 +4,8 @@ version = "0.1.0"
 description = "Whisper inference, ONNX export, optimization, and quantization tools"
 requires-python = ">=3.10"
 dependencies = [
-    "asrfront>=0.1.0",
+    "asrfront>=0.2.0",
     "huggingface-hub",
-    "librosa",
     "numpy",
     "onnx",
     "onnxruntime",
