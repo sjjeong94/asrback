@@ -117,13 +117,19 @@ class Transcriber:
         # The model and its decode caches are not safe to share across threads.
         self._lock = threading.Lock()
 
-        self.languages = language_token_ids(tokenizer_config)
+        # English-only (*.en) checkpoints have a smaller vocabulary, start decoding
+        # without language/task tokens and cannot translate.
+        self.multilingual = self.config["vocab_size"] >= 51865
+        tasks = ("transcribe", "translate") if self.multilingual else ("transcribe",)
+        if self.multilingual:
+            self.languages = language_token_ids(tokenizer_config)
+        else:
+            self.languages = {"en": required_token_id(self.tokenizer, "<|en|>")}
         self.start_id = required_token_id(self.tokenizer, "<|startoftranscript|>")
         self.prev_id = required_token_id(self.tokenizer, "<|startofprev|>")
         self.no_timestamps_id = required_token_id(self.tokenizer, "<|notimestamps|>")
         self.task_ids = {
-            task: required_token_id(self.tokenizer, f"<|{task}|>")
-            for task in ("transcribe", "translate")
+            task: required_token_id(self.tokenizer, f"<|{task}|>") for task in tasks
         }
         self.no_speech_id = self.tokenizer.token_to_id(
             "<|nospeech|>"
@@ -141,7 +147,8 @@ class Transcriber:
     ) -> Transcription:
         """Decode ``audio`` (a path, encoded file bytes, or a 16 kHz waveform)."""
         if task not in self.task_ids:
-            raise ValueError(f"task must be 'transcribe' or 'translate', got {task!r}")
+            choices = " or ".join(repr(name) for name in self.task_ids)
+            raise ValueError(f"task must be {choices} for this model, got {task!r}")
         if language is not None and language not in self.languages:
             choices = ", ".join(sorted(self.languages))
             raise ValueError(
@@ -187,14 +194,14 @@ class Transcriber:
                 break
             encoder_output = self._encode(window)
             if language is None:
-                language = self._detect_language(encoder_output)
+                language = (
+                    self._detect_language(encoder_output) if self.multilingual else "en"
+                )
 
-            sot = [
-                self.start_id,
-                self.languages[language],
-                self.task_ids[task],
-                self.no_timestamps_id,
-            ]
+            sot = [self.start_id]
+            if self.multilingual:
+                sot += [self.languages[language], self.task_ids[task]]
+            sot.append(self.no_timestamps_id)
             max_target = self.config["max_target_positions"]
             # Condition on earlier text like openai-whisper: at most half the context.
             previous = history[-(max_target // 2 - 1) :]

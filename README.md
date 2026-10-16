@@ -8,7 +8,7 @@ at runtime).
 
 ```bash
 uv sync
-scripts/download_whisper_hf.sh tiny   # -> models/whisper-tiny (tiny, base, small)
+scripts/download_whisper_hf.sh tiny   # -> models/whisper-tiny (tiny, base, small, *.en)
 ```
 
 ## Server
@@ -64,9 +64,15 @@ results. Text is normalized with Whisper's `EnglishTextNormalizer`
 | Model | Decoding | WER (test-clean) |
 | --- | --- | --- |
 | whisper-tiny | greedy | 7.54% |
+| whisper-tiny.en | greedy | 5.61% |
+| whisper-base | greedy | 5.00% |
+| whisper-base.en | greedy | 4.23% |
+| whisper-small | greedy | 3.39% |
+| whisper-small.en | greedy | 3.02% |
 
 ## Limitations
 
 - Greedy or temperature sampling only; no beam search.
 - No word-level timestamps; segments are fixed 30-second windows.
 - One model per server process.
+- English-only (`*.en`) models support transcription only, not translation.
