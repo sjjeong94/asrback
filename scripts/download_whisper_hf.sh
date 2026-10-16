@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download the Whisper files needed by inference.py from Hugging Face.
+# Download the Whisper files needed by asrback from Hugging Face.
 #
 # Usage: download_whisper_hf.sh [--tokenizer-only] [tiny|base|small ...]
 #   --tokenizer-only  Download only config/tokenizer files (skip model.safetensors).

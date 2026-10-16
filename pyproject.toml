@@ -1,16 +1,27 @@
 [project]
-name = "whisper"
+name = "asrback"
 version = "0.1.0"
-description = "Whisper inference tools"
+description = "OpenAI-compatible speech-to-text server for Whisper SafeTensors checkpoints"
 requires-python = ">=3.10"
 dependencies = [
     "asrfront>=0.2.0",
+    "fastapi",
     "numpy",
-    "openai-whisper",
+    "openai",
+    "python-multipart",
     "safetensors",
     "tokenizers",
     "torch",
+    "uvicorn",
 ]
+
+[project.scripts]
+asrback = "asrback.cli:main"
+asrback-client = "asrback.client:main"
+
+[build-system]
+requires = ["uv_build>=0.8,<0.14"]
+build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
@@ -19,9 +30,13 @@ dev = [
     "isort",
     "pre-commit",
 ]
+# evaluate.py compares against the reference openai-whisper implementation.
+eval = [
+    "openai-whisper",
+]
 
 [tool.uv]
-package = false
+default-groups = ["dev", "eval"]
 
 [tool.black]
 line-length = 88
