@@ -1,14 +1,11 @@
 [project]
 name = "whisper"
 version = "0.1.0"
-description = "Whisper inference, ONNX export, optimization, and quantization tools"
+description = "Whisper inference tools"
 requires-python = ">=3.10"
 dependencies = [
     "asrfront>=0.2.0",
-    "huggingface-hub",
     "numpy",
-    "onnx",
-    "onnxruntime",
     "openai-whisper",
     "safetensors",
     "tokenizers",

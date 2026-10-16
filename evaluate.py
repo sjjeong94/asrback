@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-DEFAULT_DATASET = Path("datasets/librispeech/LibriSpeech/test-clean")
+DEFAULT_DATASET = Path("data/librispeech/LibriSpeech/test-clean")
 
 
 @dataclass(frozen=True)

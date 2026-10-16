@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("models/huggingface/whisper-tiny"),
+        default=Path("models/whisper-tiny"),
         help="Directory containing model.safetensors and tokenizer/config JSON files.",
     )
     parser.add_argument(

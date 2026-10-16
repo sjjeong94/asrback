@@ -1,68 +1,46 @@
 #!/usr/bin/env bash
+# Download the Whisper files needed by inference.py from Hugging Face.
+#
+# Usage: download_whisper_hf.sh [--tokenizer-only] [tiny|base|small ...]
+#   --tokenizer-only  Download only config/tokenizer files (skip model.safetensors).
 set -euo pipefail
 
-MODEL_DIR="${MODEL_DIR:-models/huggingface}"
+MODEL_DIR="${MODEL_DIR:-models}"
 REVISION="${REVISION:-main}"
-if (( $# > 0 )); then
-  MODELS=("$@")
-else
+FILES=(config.json tokenizer.json tokenizer_config.json model.safetensors)
+MODELS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --tokenizer-only) FILES=(config.json tokenizer.json tokenizer_config.json) ;;
+    tiny|base|small) MODELS+=("$arg") ;;
+    *)
+      echo "Error: unsupported argument '$arg' (expected --tokenizer-only, tiny, base, or small)." >&2
+      exit 1
+      ;;
+  esac
+done
+if (( ${#MODELS[@]} == 0 )); then
   MODELS=(tiny base small)
 fi
 
-INCLUDE_PATTERNS=(
-  "*.json"
-  "*.txt"
-  "model.safetensors"
-)
+if ! command -v wget >/dev/null 2>&1; then
+  echo "Error: install wget to download models." >&2
+  exit 1
+fi
 
-download_model() {
-  local model="$1"
-  local repo="openai/whisper-$model"
-  local output_dir="$MODEL_DIR/whisper-$model"
-  local include_args=()
-  local pattern
-  for pattern in "${INCLUDE_PATTERNS[@]}"; do
-    include_args+=(--include "$pattern")
-  done
-
-  case "$model" in
-    tiny|base|small) ;;
-    *)
-      echo "Error: unsupported model '$model' (expected tiny, base, or small)." >&2
-      return 1
-      ;;
-  esac
-
-  mkdir -p "$output_dir"
-  echo "Downloading $repo@$REVISION to $output_dir..."
-
-  if command -v hf >/dev/null 2>&1; then
-    hf download "$repo" \
-      --revision "$REVISION" \
-      --local-dir "$output_dir" \
-      "${include_args[@]}"
-  elif command -v huggingface-cli >/dev/null 2>&1; then
-    huggingface-cli download "$repo" \
-      --revision "$REVISION" \
-      --local-dir "$output_dir" \
-      "${include_args[@]}"
-  elif python3 -c 'import huggingface_hub' >/dev/null 2>&1; then
-    python3 -m huggingface_hub.commands.huggingface_cli download "$repo" \
-      --revision "$REVISION" \
-      --local-dir "$output_dir" \
-      "${include_args[@]}"
-  else
-    echo "Error: Hugging Face Hub is not installed." >&2
-    echo "Install it with: uv sync (then run via: uv run $0)" >&2
-    return 1
-  fi
-
-  echo "Ready: $output_dir"
-}
-
-mkdir -p "$MODEL_DIR"
 for model in "${MODELS[@]}"; do
-  download_model "$model"
+  repo="openai/whisper-$model"
+  output_dir="$MODEL_DIR/whisper-$model"
+  mkdir -p "$output_dir"
+
+  echo "Downloading $repo@$REVISION to $output_dir..."
+  for file in "${FILES[@]}"; do
+    wget -c --tries=3 \
+      "https://huggingface.co/$repo/resolve/$REVISION/$file" \
+      -O "$output_dir/$file"
+  done
+  echo "Ready: $output_dir"
 done
 
 echo "All requested Whisper models are ready in $MODEL_DIR."

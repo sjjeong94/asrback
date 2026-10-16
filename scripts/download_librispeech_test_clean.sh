@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-datasets/librispeech}"
+DATA_DIR="${DATA_DIR:-data/librispeech}"
 URL="${URL:-https://www.openslr.org/resources/12/test-clean.tar.gz}"
 ARCHIVE="$DATA_DIR/test-clean.tar.gz"
 EXTRACTED_DIR="$DATA_DIR/LibriSpeech/test-clean"
@@ -15,14 +15,11 @@ else
     echo "Archive already exists: $ARCHIVE"
   else
     echo "Downloading LibriSpeech test-clean..."
-    if command -v curl >/dev/null 2>&1; then
-      curl -L --fail --continue-at - "$URL" -o "$ARCHIVE"
-    elif command -v wget >/dev/null 2>&1; then
-      wget -c "$URL" -O "$ARCHIVE"
-    else
-      echo "Error: install curl or wget to download the dataset." >&2
+    if ! command -v wget >/dev/null 2>&1; then
+      echo "Error: install wget to download the dataset." >&2
       exit 1
     fi
+    wget -c "$URL" -O "$ARCHIVE"
   fi
 
   echo "Verifying archive..."
