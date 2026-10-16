@@ -2,6 +2,7 @@
 name = "asrback"
 version = "0.1.0"
 description = "OpenAI-compatible speech-to-text server for Whisper SafeTensors checkpoints"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "asrfront>=0.2.0",
@@ -15,9 +16,14 @@ dependencies = [
     "uvicorn",
 ]
 
+[project.optional-dependencies]
+# asrback-eval uses Whisper's EnglishTextNormalizer for standard WER numbers.
+eval = ["openai-whisper"]
+
 [project.scripts]
 asrback = "asrback.cli:main"
 asrback-client = "asrback.client:main"
+asrback-eval = "asrback.evaluation:main"
 
 [build-system]
 requires = ["uv_build>=0.8,<0.14"]
@@ -25,18 +31,12 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "asrback[eval]",
     "black",
     "flake8",
     "isort",
     "pre-commit",
 ]
-# evaluate.py compares against the reference openai-whisper implementation.
-eval = [
-    "openai-whisper",
-]
-
-[tool.uv]
-default-groups = ["dev", "eval"]
 
 [tool.black]
 line-length = 88

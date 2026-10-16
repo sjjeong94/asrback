@@ -45,7 +45,6 @@ wheels = [
 name = "asrback"
 version = "0.1.0"
 source = { editable = "." }
-default-groups = ["dev", "eval"]
 dependencies = [
     { name = "asrfront" },
     { name = "fastapi" },
@@ -60,15 +59,18 @@ dependencies = [
     { name = "uvicorn" },
 ]
 
+[package.optional-dependencies]
+eval = [
+    { name = "openai-whisper" },
+]
+
 [package.dev-dependencies]
 dev = [
+    { name = "asrback", extra = ["eval"] },
     { name = "black" },
     { name = "flake8" },
     { name = "isort" },
     { name = "pre-commit" },
-]
-eval = [
-    { name = "openai-whisper" },
 ]
 
 [package.metadata]
@@ -77,21 +79,23 @@ requires-dist = [
     { name = "fastapi" },
     { name = "numpy" },
     { name = "openai" },
+    { name = "openai-whisper", marker = "extra == 'eval'" },
     { name = "python-multipart" },
     { name = "safetensors" },
     { name = "tokenizers" },
     { name = "torch" },
     { name = "uvicorn" },
 ]
+provides-extras = ["eval"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "asrback", extras = ["eval"] },
     { name = "black" },
     { name = "flake8" },
     { name = "isort" },
     { name = "pre-commit" },
 ]
-eval = [{ name = "openai-whisper" }]
 
 [[package]]
 name = "asrfront"
