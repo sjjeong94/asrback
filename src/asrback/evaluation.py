@@ -1,4 +1,4 @@
-"""``asrback-eval`` command: LibriSpeech test-clean WER against a running server."""
+"""``asrback-eval`` command: WER/CER on LibriSpeech or FLEURS against a running server."""
 
 from __future__ import annotations
 
@@ -6,15 +6,18 @@ import argparse
 import json
 import os
 import re
-import string
 import sys
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 DEFAULT_DATASET = Path("data/librispeech/LibriSpeech/test-clean")
+# Scored by character error rate by default: no spaces between words (ja, zh, th,
+# lo, my, yue) or words too coarse for a meaningful WER (ko).
+CER_LANGUAGES = {"ja", "zh", "ko", "th", "lo", "my", "yue"}
 
 
 @dataclass(frozen=True)
@@ -28,7 +31,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="asrback-eval",
         description="Evaluate an OpenAI-compatible transcription server on "
-        "LibriSpeech test-clean.",
+        "LibriSpeech test-clean or a FLEURS test set.",
     )
     parser.add_argument(
         "--base-url",
@@ -42,12 +45,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dataset",
         type=Path,
         default=DEFAULT_DATASET,
-        help=f"Path to LibriSpeech test-clean. Default: {DEFAULT_DATASET}",
+        help="LibriSpeech test-clean directory, or a FLEURS language directory "
+        f"such as data/fleurs/ko_kr. Default: {DEFAULT_DATASET}",
     )
     parser.add_argument(
         "--language",
-        default="en",
-        help="Language code sent with each request; '' to auto-detect. Default: en",
+        default=None,
+        help="Language code sent with each request; '' to auto-detect. "
+        "Default: from the dataset (en for LibriSpeech, ko for fleurs/ko_kr)",
+    )
+    parser.add_argument(
+        "--metric",
+        choices=("wer", "cer"),
+        default=None,
+        help="Word or character error rate. Default: cer for "
+        f"{', '.join(sorted(CER_LANGUAGES))}, otherwise wer",
     )
     parser.add_argument("--temperature", type=float, default=0.0, help="Default: 0.0")
     parser.add_argument(
@@ -77,7 +89,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip utterances already in --output and include them in the WER.",
+        help="Skip utterances already in --output and include them in the score.",
     )
     args = parser.parse_args(argv)
     if args.base_url is None:
@@ -91,13 +103,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def is_fleurs(dataset_dir: Path) -> bool:
+    return (dataset_dir / "test.tsv").is_file()
+
+
+def dataset_language(dataset_dir: Path) -> str:
+    """Language of a dataset: FLEURS directories are named like ``ko_kr``."""
+    if is_fleurs(dataset_dir):
+        return dataset_dir.name.split("_")[0]
+    return "en"
+
+
 def load_samples(dataset_dir: Path) -> list[Sample]:
     if not dataset_dir.is_dir():
         raise FileNotFoundError(
             f"Dataset directory not found: {dataset_dir}\n"
-            "Run ./scripts/download_librispeech_test_clean.sh first."
+            "Run ./scripts/download_librispeech_test_clean.sh or "
+            "./scripts/download_fleurs_test.sh first."
         )
+    if is_fleurs(dataset_dir):
+        return load_fleurs(dataset_dir)
+    return load_librispeech(dataset_dir)
 
+
+def load_fleurs(dataset_dir: Path) -> list[Sample]:
+    """``test.tsv`` rows: id, file name, raw transcription, normalized
+    transcription, characters, sample count, gender. Audio is in ``test/``."""
+    transcript_path = dataset_dir / "test.tsv"
+    samples = []
+    with transcript_path.open(encoding="utf-8") as transcript_file:
+        for line_number, line in enumerate(transcript_file, start=1):
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            if len(fields) != 7:
+                raise ValueError(
+                    f"Malformed transcript line {transcript_path}:{line_number}"
+                )
+            file_name, reference = fields[1], fields[2]
+            audio_path = dataset_dir / "test" / file_name
+            if not audio_path.is_file():
+                raise FileNotFoundError(f"Missing audio file: {audio_path}")
+            # FLEURS ids repeat across speakers; the file name is unique.
+            samples.append(Sample(Path(file_name).stem, audio_path, reference))
+    if not samples:
+        raise FileNotFoundError(f"No transcripts found in {transcript_path}")
+    return sorted(samples, key=lambda sample: sample.utterance_id)
+
+
+def load_librispeech(dataset_dir: Path) -> list[Sample]:
     transcript_paths = sorted(dataset_dir.glob("*/*/*.trans.txt"))
     if not transcript_paths:
         raise FileNotFoundError(f"No transcript files found under {dataset_dir}")
@@ -122,21 +177,36 @@ def load_samples(dataset_dir: Path) -> list[Sample]:
     return sorted(samples, key=lambda sample: sample.utterance_id)
 
 
-def get_text_normalizer() -> tuple[Callable[[str], str], str]:
-    """Whisper's English normalizer when openai-whisper is installed."""
+def get_text_normalizer(language: str) -> tuple[Callable[[str], str], str]:
+    """Whisper's English or basic normalizer when openai-whisper is installed."""
     try:
-        from whisper.normalizers import EnglishTextNormalizer
+        from whisper.normalizers import BasicTextNormalizer, EnglishTextNormalizer
     except ImportError:
-        punctuation = str.maketrans("", "", string.punctuation)
 
         def fallback(text: str) -> str:
-            text = text.lower().translate(punctuation)
+            # Lowercase and turn punctuation and symbols into spaces.
+            text = unicodedata.normalize("NFKC", text).lower()
+            text = "".join(
+                " " if unicodedata.category(char)[0] in "PS" else char for char in text
+            )
             return re.sub(r"\s+", " ", text).strip()
 
         return fallback, "basic (install openai-whisper for Whisper's normalizer)"
 
-    normalizer = EnglishTextNormalizer()
-    return lambda text: normalizer(text).strip(), "whisper EnglishTextNormalizer"
+    if language == "en":
+        normalizer = EnglishTextNormalizer()
+        name = "whisper EnglishTextNormalizer"
+    else:
+        normalizer = BasicTextNormalizer()
+        name = "whisper BasicTextNormalizer"
+    return lambda text: re.sub(r"\s+", " ", normalizer(text)).strip(), name
+
+
+def score_units(text: str, metric: str) -> list[str]:
+    """Words for WER, or characters without spaces for CER."""
+    if metric == "cer":
+        return list(text.replace(" ", ""))
+    return text.split()
 
 
 def load_previous(output: Path) -> dict[str, dict]:
@@ -152,7 +222,7 @@ def load_previous(output: Path) -> dict[str, dict]:
     return rows
 
 
-def word_edit_distance(reference: list[str], hypothesis: list[str]) -> int:
+def edit_distance(reference: list[str], hypothesis: list[str]) -> int:
     previous = list(range(len(hypothesis) + 1))
     for i, reference_word in enumerate(reference, start=1):
         current = [i]
@@ -177,6 +247,11 @@ def main(argv: list[str] | None = None) -> int:
         samples = load_samples(args.dataset)
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
+    data_language = dataset_language(args.dataset)
+    language = data_language if args.language is None else args.language
+    metric = args.metric or ("cer" if data_language in CER_LANGUAGES else "wer")
+    metric_name = metric.upper()
+    unit_name = "characters" if metric == "cer" else "words"
     if args.limit is not None:
         samples = samples[: args.limit]
     total = len(samples)
@@ -187,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
         for sample in samples
         if sample.utterance_id in previous
     }
+    if any(row.get("metric", "wer") != metric for row in previous.values()):
+        raise SystemExit(f"{args.output} was scored with a different metric.")
     samples = [sample for sample in samples if sample.utterance_id not in previous]
     if args.sort_by_length:
         samples.sort(key=lambda sample: sample.audio_path.stat().st_size, reverse=True)
@@ -209,13 +286,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Server: {base_url} (models: {', '.join(served) or 'none'})")
     if any(served != served_by_server[0] for served in served_by_server):
         print("Warning: servers report different models.")
-    normalize, normalizer_name = get_text_normalizer()
+    normalize, normalizer_name = get_text_normalizer(data_language)
 
     print(f"Dataset: {args.dataset}")
+    print(f"Language: {language or 'auto-detect'}")
     print(f"Samples: {total}")
     if previous:
         print(f"Resumed: {len(previous)} from {args.output}")
     print(f"Normalizer: {normalizer_name}")
+    print(f"Metric: {metric_name}")
     sys.stdout.flush()
 
     options = {
@@ -223,8 +302,8 @@ def main(argv: list[str] | None = None) -> int:
         "response_format": "verbose_json",
         "temperature": args.temperature,
     }
-    if args.language:
-        options["language"] = args.language
+    if language:
+        options["language"] = language
 
     def transcribe(sample: Sample, client: openai.OpenAI) -> tuple[str, float]:
         with sample.audio_path.open("rb") as file:
@@ -241,7 +320,10 @@ def main(argv: list[str] | None = None) -> int:
         output_file.flush()
 
     errors = sum(row["errors"] for row in previous.values())
-    words = sum(len(row["normalized_reference"].split()) for row in previous.values())
+    units = sum(
+        len(score_units(row["normalized_reference"], metric))
+        for row in previous.values()
+    )
     audio_seconds = 0.0
     started = time.perf_counter()
     executor = ThreadPoolExecutor(max_workers=args.concurrency)
@@ -257,11 +339,14 @@ def main(argv: list[str] | None = None) -> int:
             except openai.APIError as exc:
                 raise SystemExit(f"{sample.utterance_id}: {exc}") from exc
 
-            reference_words = normalize(sample.reference).split()
-            hypothesis_words = normalize(hypothesis).split()
-            utterance_errors = word_edit_distance(reference_words, hypothesis_words)
+            normalized_reference = normalize(sample.reference)
+            normalized_hypothesis = normalize(hypothesis)
+            reference_units = score_units(normalized_reference, metric)
+            utterance_errors = edit_distance(
+                reference_units, score_units(normalized_hypothesis, metric)
+            )
             errors += utterance_errors
-            words += len(reference_words)
+            units += len(reference_units)
             audio_seconds += duration
 
             if output_file is not None:
@@ -270,8 +355,9 @@ def main(argv: list[str] | None = None) -> int:
                     "audio_path": str(sample.audio_path),
                     "reference": sample.reference,
                     "hypothesis": hypothesis,
-                    "normalized_reference": " ".join(reference_words),
-                    "normalized_hypothesis": " ".join(hypothesis_words),
+                    "normalized_reference": normalized_reference,
+                    "normalized_hypothesis": normalized_hypothesis,
+                    "metric": metric,
                     "errors": utterance_errors,
                     "duration": duration,
                 }
@@ -279,8 +365,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_file.flush()
 
             if done == len(previous) + 1 or done % 25 == 0 or done == total:
-                wer = errors / words * 100 if words else 0.0
-                print(f"Processed {done}/{total}  WER so far: {wer:.2f}%")
+                rate = errors / units * 100 if units else 0.0
+                print(f"Processed {done}/{total}  {metric_name} so far: {rate:.2f}%")
                 sys.stdout.flush()
     except KeyboardInterrupt:
         print("\nInterrupted.")
@@ -292,11 +378,13 @@ def main(argv: list[str] | None = None) -> int:
             output_file.close()
 
     elapsed = time.perf_counter() - started
-    if words == 0:
-        raise SystemExit("Cannot compute WER with zero reference words.")
-    print(f"WER: {errors / words * 100:.2f}%")
-    print(f"Word errors: {errors}")
-    print(f"Reference words: {words}")
+    if units == 0:
+        raise SystemExit(
+            f"Cannot compute {metric_name} with zero reference {unit_name}."
+        )
+    print(f"{metric_name}: {errors / units * 100:.2f}%")
+    print(f"Errors: {errors}")
+    print(f"Reference {unit_name}: {units}")
     if samples:
         print(
             f"Audio: {audio_seconds:.1f}s  Elapsed: {elapsed:.1f}s  "
