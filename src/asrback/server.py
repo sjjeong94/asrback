@@ -10,7 +10,8 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from .transcriber import Transcriber, Transcription
+from .models import SenseVoiceTranscriber, Transcriber
+from .transcription import Transcription
 
 RESPONSE_FORMATS = ("json", "text", "srt", "verbose_json", "vtt")
 
@@ -83,7 +84,9 @@ def render(result: Transcription, response_format: str) -> Response:
     return PlainTextResponse(to_vtt(result), media_type="text/vtt")
 
 
-def create_app(transcriber: Transcriber, model_name: str) -> FastAPI:
+def create_app(
+    transcriber: Transcriber | SenseVoiceTranscriber, model_name: str
+) -> FastAPI:
     """Build the app. Requests may name any model; ``model_name`` is what we list."""
     app = FastAPI(title="asrback")
     created = int(time.time())

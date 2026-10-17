@@ -24,7 +24,7 @@ import yaml
 from sentencepiece import SentencePieceProcessor
 from torch import Tensor, nn
 
-from .transcriber import (
+from ..transcription import (
     DTYPES,
     AudioSource,
     Segment,

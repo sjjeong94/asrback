@@ -76,32 +76,21 @@ def main(argv: list[str] | None = None) -> int:
     import torch
     import uvicorn
 
-    from .sensevoice import SenseVoiceTranscriber, is_sensevoice
+    from .models import load_transcriber
     from .server import create_app
-    from .transcriber import Transcriber
 
     # TF32 matmuls on Ampere+ GPUs; no effect on CPU or half precision.
     torch.set_float32_matmul_precision("high")
-    options = {
-        "device": args.device,
-        "dtype": args.dtype,
-        "max_batch_size": args.max_batch_size,
-        "batch_wait_ms": args.batch_wait_ms,
-    }
     try:
-        if is_sensevoice(args.model_dir):
-            if args.cuda_graphs or args.compile_encoder:
-                raise ValueError(
-                    "--cuda-graphs and --compile-encoder apply to Whisper models only"
-                )
-            transcriber = SenseVoiceTranscriber(args.model_dir, **options)
-        else:
-            transcriber = Transcriber(
-                args.model_dir,
-                cuda_graphs=args.cuda_graphs,
-                compile_encoder=args.compile_encoder,
-                **options,
-            )
+        transcriber = load_transcriber(
+            args.model_dir,
+            device=args.device,
+            dtype=args.dtype,
+            max_batch_size=args.max_batch_size,
+            batch_wait_ms=args.batch_wait_ms,
+            cuda_graphs=args.cuda_graphs,
+            compile_encoder=args.compile_encoder,
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     model_name = args.model_name or args.model_dir.resolve().name
