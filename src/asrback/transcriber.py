@@ -1,13 +1,20 @@
-"""Greedy / sampled Whisper decoding over 30-second audio windows."""
+"""Greedy / sampled Whisper decoding over 30-second audio windows.
+
+Concurrent requests are decoded together: callers queue one window at a time and a
+single worker thread runs them in batches.
+"""
 
 from __future__ import annotations
 
 import json
 import math
 import os
+import queue
 import re
 import threading
+import time
 import zlib
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
@@ -20,7 +27,7 @@ from safetensors.torch import load_file
 from tokenizers import Tokenizer
 from torch import Tensor
 
-from .model import WhisperForConditionalGeneration
+from .model import DecoderCache, WhisperForConditionalGeneration
 
 AudioSource = Union[str, os.PathLike, bytes, bytearray, memoryview, np.ndarray]
 
@@ -28,6 +35,12 @@ SAMPLE_RATE = asrfront.whisper.SAMPLE_RATE
 WINDOW_SAMPLES = asrfront.whisper.N_SAMPLES
 # Trailing windows shorter than this are mostly padding and invite hallucinations.
 MIN_TAIL_SAMPLES = SAMPLE_RATE // 10
+
+DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 REQUIRED_FILES = (
     "model.safetensors",
@@ -89,14 +102,88 @@ def compression_ratio(text: str) -> float:
     return len(data) / len(zlib.compress(data)) if data else 0.0
 
 
-class Transcriber:
-    """Loads a Whisper checkpoint once and transcribes or translates audio."""
+@dataclass
+class _Job:
+    """One 30-second window waiting to be decoded."""
 
-    def __init__(self, model_dir: str | os.PathLike, device: str | None = None):
+    log_mel: np.ndarray
+    previous: list[int]
+    language: str | None
+    task: str
+    temperature: float
+    max_new_tokens: int | None
+    future: Future = field(default_factory=Future)
+
+
+@dataclass
+class _Result:
+    language: str
+    tokens: list[int]
+    avg_logprob: float
+    no_speech_prob: float
+
+
+class _GraphStep:
+    """One decoder step for a fixed batch size, captured as a CUDA graph.
+
+    Inputs are read from ``tokens`` and ``position`` and the step writes into
+    ``cache`` in place; :meth:`replay` returns float32 logits for the new token.
+    """
+
+    def __init__(
+        self,
+        model: WhisperForConditionalGeneration,
+        cache: DecoderCache,
+        tokens: Tensor,
+        position: Tensor,
+    ) -> None:
+        def step() -> Tensor:
+            hidden = model.decode(tokens, position, cache)
+            return model.logits(hidden[:, -1]).float()
+
+        # Warm up on a side stream so lazy initialization stays out of the graph.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
+            self.logits = step()
+
+    def replay(self) -> Tensor:
+        self.graph.replay()
+        return self.logits
+
+
+class Transcriber:
+    """Loads a Whisper checkpoint once and transcribes or translates audio.
+
+    ``transcribe`` is thread-safe: windows from concurrent calls are decoded in
+    batches of up to ``max_batch_size``, waiting at most ``batch_wait_ms`` for a
+    batch to fill. ``cuda_graphs`` (default: on for CUDA) replays each decoder step
+    from a captured graph instead of launching its kernels one by one.
+    """
+
+    def __init__(
+        self,
+        model_dir: str | os.PathLike,
+        device: str | None = None,
+        dtype: str | torch.dtype | None = None,
+        max_batch_size: int = 16,
+        batch_wait_ms: float = 5.0,
+        cuda_graphs: bool | None = None,
+    ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
             if not (model_dir / filename).is_file():
                 raise FileNotFoundError(f"Missing model file: {model_dir / filename}")
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be greater than zero")
+        if batch_wait_ms < 0:
+            raise ValueError("batch_wait_ms must be non-negative")
 
         self.model_dir = model_dir
         self.config = load_json(model_dir / "config.json")
@@ -105,6 +192,18 @@ class Transcriber:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
+        if dtype is None:
+            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        elif isinstance(dtype, str):
+            dtype = DTYPES[dtype]
+        self.dtype = dtype
+        if cuda_graphs is None:
+            cuda_graphs = self.device.type == "cuda"
+        if cuda_graphs and self.device.type != "cuda":
+            raise ValueError("cuda_graphs requires a CUDA device")
+        self.cuda_graphs = cuda_graphs
+        self.max_batch_size = max_batch_size
+        self.batch_wait = batch_wait_ms / 1000
 
         model = WhisperForConditionalGeneration(self.config)
         state_dict = load_file(str(model_dir / "model.safetensors"), device="cpu")
@@ -113,9 +212,7 @@ class Transcriber:
             raise RuntimeError(
                 f"weight mismatch: missing={missing}, unexpected={unexpected}"
             )
-        self.model = model.eval().to(self.device)
-        # The model and its decode caches are not safe to share across threads.
-        self._lock = threading.Lock()
+        self.model = model.eval().to(self.device, self.dtype)
 
         # English-only (*.en) checkpoints have a smaller vocabulary, start decoding
         # without language/task tokens and cannot translate.
@@ -134,6 +231,40 @@ class Transcriber:
         self.no_speech_id = self.tokenizer.token_to_id(
             "<|nospeech|>"
         ) or self.tokenizer.token_to_id("<|nocaptions|>")
+
+        # Tokens never sampled: configured suppressions and every timestamp token.
+        vocab_size = self.config["vocab_size"]
+        suppress = torch.zeros(vocab_size, dtype=torch.bool)
+        suppress[self.config.get("suppress_tokens", [])] = True
+        suppress[self.no_timestamps_id + 1 :] = True
+        first_suppress = suppress.clone()
+        first_suppress[self.config.get("begin_suppress_tokens", [])] = True
+        self._suppress = suppress.to(self.device)
+        self._first_suppress = first_suppress.to(self.device)
+        self._language_ids = torch.tensor(
+            list(self.languages.values()), device=self.device
+        )
+        self._positions = torch.arange(
+            self.config["max_target_positions"], device=self.device
+        )
+
+        # Batch sizes with their own CUDA graph; a batch is padded up to one.
+        self._buckets = sorted(
+            {
+                min(2**power, max_batch_size)
+                for power in range(max_batch_size.bit_length())
+            }
+            | {max_batch_size}
+        )
+        self._cache: DecoderCache | None = None
+        self._graphs: dict[int, _GraphStep] = {}
+        if self.cuda_graphs:
+            self._capture_graphs()
+
+        self._queue: queue.SimpleQueue[_Job] = queue.SimpleQueue()
+        threading.Thread(
+            target=self._serve, name="asrback-decoder", daemon=True
+        ).start()
 
     def transcribe(
         self,
@@ -165,67 +296,37 @@ class Transcriber:
             waveform = asrfront.load(audio)
         duration = len(waveform) / SAMPLE_RATE
 
-        with self._lock:
-            return self._transcribe(
-                waveform, duration, language, task, prompt, temperature, max_new_tokens
-            )
-
-    @torch.inference_mode()
-    def _transcribe(
-        self,
-        waveform: np.ndarray,
-        duration: float,
-        language: str | None,
-        task: str,
-        prompt: str | None,
-        temperature: float,
-        max_new_tokens: int | None,
-    ) -> Transcription:
         history = []
         if prompt and prompt.strip():
             history = self.tokenizer.encode(
                 " " + prompt.strip(), add_special_tokens=False
             ).ids
+        max_target = self.config["max_target_positions"]
 
         segments = []
-        for seek in range(0, max(len(waveform), 1), WINDOW_SAMPLES):
-            window = waveform[seek : seek + WINDOW_SAMPLES]
-            if segments and len(window) < MIN_TAIL_SAMPLES:
-                break
-            encoder_output = self._encode(window)
-            if language is None:
-                language = (
-                    self._detect_language(encoder_output) if self.multilingual else "en"
-                )
-
-            sot = [self.start_id]
-            if self.multilingual:
-                sot += [self.languages[language], self.task_ids[task]]
-            sot.append(self.no_timestamps_id)
-            max_target = self.config["max_target_positions"]
+        # Windows are decoded in order: each one is conditioned on earlier text.
+        for seek, length, log_mel in self._windows(waveform):
             # Condition on earlier text like openai-whisper: at most half the context.
             previous = history[-(max_target // 2 - 1) :]
-            prefix = ([self.prev_id] + previous if previous else []) + sot
-            available = max_target - len(prefix)
-            limit = min(max_new_tokens or available, available)
+            job = _Job(log_mel, previous, language, task, temperature, max_new_tokens)
+            self._queue.put(job)
+            result: _Result = job.future.result()
+            language = result.language
 
-            tokens, avg_logprob, no_speech_prob = self._generate(
-                encoder_output, prefix, len(prefix) - len(sot), limit, temperature
-            )
-            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-            history.extend(tokens)
+            text = self.tokenizer.decode(result.tokens, skip_special_tokens=True)
+            history.extend(result.tokens)
             segments.append(
                 Segment(
                     id=len(segments),
                     seek=seek // asrfront.whisper.HOP_LENGTH,
                     start=round(seek / SAMPLE_RATE, 3),
-                    end=round((seek + len(window)) / SAMPLE_RATE, 3),
+                    end=round((seek + length) / SAMPLE_RATE, 3),
                     text=text,
-                    tokens=tokens,
+                    tokens=result.tokens,
                     temperature=temperature,
-                    avg_logprob=avg_logprob,
+                    avg_logprob=result.avg_logprob,
                     compression_ratio=compression_ratio(text),
-                    no_speech_prob=no_speech_prob,
+                    no_speech_prob=result.no_speech_prob,
                 )
             )
 
@@ -237,57 +338,180 @@ class Transcriber:
             segments=segments,
         )
 
-    def _encode(self, window: np.ndarray) -> Tensor:
-        log_mel = asrfront.whisper.log_mel(window, n_mels=self.config["num_mel_bins"])
-        mel = torch.from_numpy(log_mel).float().unsqueeze(0).to(self.device)
-        return self.model.model.encoder(mel)
-
-    def _detect_language(self, encoder_output: Tensor) -> str:
-        token = torch.tensor([[self.start_id]], device=self.device)
-        logits, _ = self.model.decode(token, encoder_output)
-        language_ids = list(self.languages.values())
-        best_index = logits[0, -1, language_ids].argmax().item()
-        return list(self.languages.keys())[best_index]
-
-    def _generate(
-        self,
-        encoder_output: Tensor,
-        prefix: list[int],
-        sot_index: int,
-        max_new_tokens: int,
-        temperature: float,
-    ) -> tuple[list[int], float, float]:
-        tokens = torch.tensor([prefix], device=self.device)
-        logits, caches = self.model.decode(tokens, encoder_output)
-
-        no_speech_prob = 0.0
-        if self.no_speech_id is not None:
-            sot_probs = logits[0, sot_index].float().softmax(dim=-1)
-            no_speech_prob = float(sot_probs[self.no_speech_id])
-
-        generated = []
-        sum_logprob = 0.0
-        eos = self.config["eos_token_id"]
-        suppress = set(self.config.get("suppress_tokens", []))
-        begin_suppress = set(self.config.get("begin_suppress_tokens", []))
-
-        for step in range(max_new_tokens):
-            next_logits = logits[0, -1].float()
-            blocked = suppress | (begin_suppress if step == 0 else set())
-            if blocked:
-                next_logits[list(blocked)] = -math.inf
-            next_logits[self.no_timestamps_id + 1 :] = -math.inf
-            if temperature > 0:
-                probs = F.softmax(next_logits / temperature, dim=-1)
-                next_token = int(torch.multinomial(probs, 1).item())
-            else:
-                next_token = int(next_logits.argmax().item())
-            sum_logprob += float(F.log_softmax(next_logits, dim=-1)[next_token])
-            if next_token == eos:
+    def _windows(self, waveform: np.ndarray) -> list[tuple[int, int, np.ndarray]]:
+        """Split into 30-second windows: ``(seek, length, log_mel)`` each."""
+        windows = []
+        for seek in range(0, max(len(waveform), 1), WINDOW_SAMPLES):
+            window = waveform[seek : seek + WINDOW_SAMPLES]
+            if windows and len(window) < MIN_TAIL_SAMPLES:
                 break
-            generated.append(next_token)
-            token = torch.tensor([[next_token]], device=self.device)
-            logits, caches = self.model.decode(token, encoder_output, caches)
+            log_mel = asrfront.whisper.log_mel(
+                window, n_mels=self.config["num_mel_bins"]
+            )
+            windows.append((seek, len(window), log_mel))
+        return windows
 
-        avg_logprob = sum_logprob / (len(generated) + 1)
-        return generated, avg_logprob, no_speech_prob
+    @torch.inference_mode()
+    def _capture_graphs(self) -> None:
+        if self.device.index is not None:
+            torch.cuda.set_device(self.device)
+        self._cache = self.model.allocate_cache(self.max_batch_size)
+        self._step_tokens = torch.zeros(
+            (self.max_batch_size, 1), dtype=torch.long, device=self.device
+        )
+        self._step_position = torch.zeros(1, dtype=torch.long, device=self.device)
+        for batch_size in self._buckets:
+            self._graphs[batch_size] = _GraphStep(
+                self.model,
+                self._cache.narrow(batch_size),
+                self._step_tokens[:batch_size],
+                self._step_position,
+            )
+
+    def _serve(self) -> None:
+        """Worker loop: gather queued windows into batches and decode them."""
+        if self.device.type == "cuda" and self.device.index is not None:
+            torch.cuda.set_device(self.device)
+        while True:
+            jobs = [self._queue.get()]
+            deadline = time.monotonic() + self.batch_wait
+            while len(jobs) < self.max_batch_size:
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining > 0:
+                        jobs.append(self._queue.get(timeout=remaining))
+                    else:
+                        jobs.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            # Rows of a batch must share the prefix length and token budget.
+            groups: dict[tuple[int, int], list[_Job]] = {}
+            for job in jobs:
+                groups.setdefault(self._layout(job), []).append(job)
+            for (prefix_length, limit), group in groups.items():
+                try:
+                    results = self._decode_batch(group, prefix_length, limit)
+                except BaseException as exc:
+                    for job in group:
+                        job.future.set_exception(exc)
+                    continue
+                for job, result in zip(group, results):
+                    job.future.set_result(result)
+
+    def _sot(self, language: str, task: str) -> list[int]:
+        sot = [self.start_id]
+        if self.multilingual:
+            sot += [self.languages[language], self.task_ids[task]]
+        return sot + [self.no_timestamps_id]
+
+    def _layout(self, job: _Job) -> tuple[int, int]:
+        """``(prefix_length, max_new_tokens)`` for a job."""
+        previous = len(job.previous) + 1 if job.previous else 0
+        prefix_length = previous + len(self._sot("en", job.task))
+        available = self.config["max_target_positions"] - prefix_length
+        return prefix_length, min(job.max_new_tokens or available, available)
+
+    @torch.inference_mode()
+    def _decode_batch(
+        self, jobs: list[_Job], prefix_length: int, limit: int
+    ) -> list[_Result]:
+        batch_size = len(jobs)
+        mel = torch.from_numpy(np.stack([job.log_mel for job in jobs]))
+        encoder_output = self.model.model.encoder(mel.to(self.device, self.dtype))
+
+        graph = None
+        if self.cuda_graphs:
+            bucket = next(size for size in self._buckets if size >= batch_size)
+            graph = self._graphs[bucket]
+        elif self._cache is None or self._cache.batch_size < batch_size:
+            self._cache = self.model.allocate_cache(batch_size)
+        cache = self._cache.narrow(batch_size)
+        self.model.set_encoder_output(cache, encoder_output)
+
+        languages = [job.language for job in jobs]
+        if None in languages:
+            detected = self._detect_languages(cache, batch_size)
+            languages = [given or found for given, found in zip(languages, detected)]
+
+        prefixes = []
+        for job, language in zip(jobs, languages):
+            previous = [self.prev_id] + job.previous if job.previous else []
+            prefixes.append(previous + self._sot(language, job.task))
+        tokens = torch.tensor(prefixes, device=self.device)
+        sot_index = prefix_length - len(self._sot("en", jobs[0].task))
+
+        hidden = self.model.decode(
+            tokens, self._positions[:prefix_length], cache, length=prefix_length
+        )
+        logits = self.model.logits(hidden[:, [sot_index, prefix_length - 1]]).float()
+        if self.no_speech_id is not None:
+            no_speech_probs = logits[:, 0].softmax(dim=-1)[:, self.no_speech_id]
+        else:
+            no_speech_probs = torch.zeros(batch_size, device=self.device)
+        next_logits = logits[:, 1]
+
+        temperatures = torch.tensor(
+            [job.temperature for job in jobs], device=self.device
+        )
+        sampling = any(job.temperature > 0 for job in jobs)
+        eos = self.config["eos_token_id"]
+        generated = torch.empty(
+            (batch_size, limit), dtype=torch.long, device=self.device
+        )
+        sum_logprobs = torch.zeros(batch_size, device=self.device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        steps = 0
+        for step in range(limit):
+            suppress = self._first_suppress if step == 0 else self._suppress
+            next_logits.masked_fill_(suppress, -math.inf)
+            token = next_logits.argmax(dim=-1)
+            if sampling:
+                scaled = next_logits / temperatures.clamp(min=1e-6)[:, None]
+                sampled = torch.multinomial(F.softmax(scaled, dim=-1), 1).squeeze(1)
+                token = torch.where(temperatures > 0, sampled, token)
+            logprob = F.log_softmax(next_logits, dim=-1).gather(1, token[:, None])
+            # Rows that already ended keep decoding padding; ignore their scores.
+            sum_logprobs += logprob.squeeze(1).masked_fill(finished, 0.0)
+            generated[:, step] = token
+            finished |= token == eos
+            steps = step + 1
+            # The only host synchronization per step.
+            if steps == limit or bool(finished.all()):
+                break
+
+            position = prefix_length + step
+            if graph is not None:
+                self._step_tokens[:batch_size, 0].copy_(token)
+                self._step_position.fill_(position)
+                next_logits = graph.replay()[:batch_size]
+            else:
+                hidden = self.model.decode(
+                    token[:, None],
+                    self._positions[position : position + 1],
+                    cache,
+                    length=position + 1,
+                )
+                next_logits = self.model.logits(hidden[:, -1]).float()
+
+        results = []
+        rows = generated[:, :steps].tolist()
+        for row, language, sum_logprob, no_speech_prob in zip(
+            rows, languages, sum_logprobs.tolist(), no_speech_probs.tolist()
+        ):
+            if eos in row:
+                row = row[: row.index(eos)]
+            avg_logprob = sum_logprob / (len(row) + 1)
+            results.append(_Result(language, row, avg_logprob, no_speech_prob))
+        return results
+
+    def _detect_languages(self, cache: DecoderCache, batch_size: int) -> list[str]:
+        if not self.multilingual:
+            return ["en"] * batch_size
+        tokens = torch.full((batch_size, 1), self.start_id, device=self.device)
+        # Writes cache position 0, which the prefix pass then overwrites.
+        hidden = self.model.decode(tokens, self._positions[:1], cache, length=1)
+        logits = self.model.logits(hidden[:, -1])[:, self._language_ids]
+        names = list(self.languages)
+        return [names[index] for index in logits.argmax(dim=-1).tolist()]

@@ -32,9 +32,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("ASRBACK_BASE_URL", "http://127.0.0.1:8000/v1"),
-        help="Server API base URL. Default: $ASRBACK_BASE_URL or "
-        "http://127.0.0.1:8000/v1",
+        action="append",
+        default=None,
+        help="Server API base URL; repeat to spread requests over several servers. "
+        "Default: $ASRBACK_BASE_URL or http://127.0.0.1:8000/v1",
     )
     parser.add_argument("--model", default="whisper-1", help="Default: whisper-1")
     parser.add_argument(
@@ -58,8 +59,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=4,
-        help="Requests in flight at once. Default: 4",
+        default=32,
+        help="Requests in flight at once; keep it above the server's batch size. "
+        "Default: 32",
+    )
+    parser.add_argument(
+        "--sort-by-length",
+        action="store_true",
+        help="Send the longest files first so concurrent requests batch well.",
     )
     parser.add_argument(
         "--output",
@@ -67,7 +74,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional JSONL file for per-utterance predictions.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip utterances already in --output and include them in the WER.",
+    )
     args = parser.parse_args(argv)
+    if args.base_url is None:
+        args.base_url = [os.environ.get("ASRBACK_BASE_URL", "http://127.0.0.1:8000/v1")]
+    if args.resume and args.output is None:
+        parser.error("--resume requires --output")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be greater than zero")
     if args.concurrency <= 0:
@@ -123,6 +139,19 @@ def get_text_normalizer() -> tuple[Callable[[str], str], str]:
     return lambda text: normalizer(text).strip(), "whisper EnglishTextNormalizer"
 
 
+def load_previous(output: Path) -> dict[str, dict]:
+    """Rows of an earlier ``--output`` file by utterance id (empty if missing)."""
+    if not output.is_file():
+        return {}
+    rows = {}
+    with output.open(encoding="utf-8") as file:
+        for line in file:
+            if line.strip():
+                row = json.loads(line)
+                rows[row["utterance_id"]] = row
+    return rows
+
+
 def word_edit_distance(reference: list[str], hypothesis: list[str]) -> int:
     previous = list(range(len(hypothesis) + 1))
     for i, reference_word in enumerate(reference, start=1):
@@ -150,24 +179,42 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(str(exc)) from exc
     if args.limit is not None:
         samples = samples[: args.limit]
+    total = len(samples)
 
-    client = openai.OpenAI(
-        base_url=args.base_url,
-        api_key=os.environ.get("OPENAI_API_KEY", "asrback"),
-        max_retries=0,
-    )
-    try:
-        served = [model.id for model in client.models.list()]
-    except openai.APIConnectionError as exc:
-        raise SystemExit(
-            f"Cannot connect to {args.base_url}. Start the server first, e.g.\n"
-            "  asrback --model-dir models/whisper-tiny"
-        ) from exc
+    previous = load_previous(args.output) if args.resume else {}
+    previous = {
+        sample.utterance_id: previous[sample.utterance_id]
+        for sample in samples
+        if sample.utterance_id in previous
+    }
+    samples = [sample for sample in samples if sample.utterance_id not in previous]
+    if args.sort_by_length:
+        samples.sort(key=lambda sample: sample.audio_path.stat().st_size, reverse=True)
+
+    api_key = os.environ.get("OPENAI_API_KEY", "asrback")
+    clients = [
+        openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        for base_url in args.base_url
+    ]
+    served_by_server = []
+    for base_url, client in zip(args.base_url, clients):
+        try:
+            served = [model.id for model in client.models.list()]
+        except openai.APIConnectionError as exc:
+            raise SystemExit(
+                f"Cannot connect to {base_url}. Start the server first, e.g.\n"
+                "  asrback --model-dir models/whisper-tiny"
+            ) from exc
+        served_by_server.append(served)
+        print(f"Server: {base_url} (models: {', '.join(served) or 'none'})")
+    if any(served != served_by_server[0] for served in served_by_server):
+        print("Warning: servers report different models.")
     normalize, normalizer_name = get_text_normalizer()
 
-    print(f"Server: {args.base_url} (models: {', '.join(served) or 'none'})")
     print(f"Dataset: {args.dataset}")
-    print(f"Samples: {len(samples)}")
+    print(f"Samples: {total}")
+    if previous:
+        print(f"Resumed: {len(previous)} from {args.output}")
     print(f"Normalizer: {normalizer_name}")
     sys.stdout.flush()
 
@@ -179,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.language:
         options["language"] = args.language
 
-    def transcribe(sample: Sample) -> tuple[str, float]:
+    def transcribe(sample: Sample, client: openai.OpenAI) -> tuple[str, float]:
         with sample.audio_path.open("rb") as file:
             result = client.audio.transcriptions.create(file=file, **options)
         return result.text.strip(), float(result.duration)
@@ -187,16 +234,23 @@ def main(argv: list[str] | None = None) -> int:
     output_file = None
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
+        # Rewrite resumed rows first so a stale or partial line cannot survive.
         output_file = args.output.open("w", encoding="utf-8")
+        for row in previous.values():
+            output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        output_file.flush()
 
-    errors = 0
-    words = 0
+    errors = sum(row["errors"] for row in previous.values())
+    words = sum(len(row["normalized_reference"].split()) for row in previous.values())
     audio_seconds = 0.0
     started = time.perf_counter()
     executor = ThreadPoolExecutor(max_workers=args.concurrency)
     try:
-        futures = {executor.submit(transcribe, sample): sample for sample in samples}
-        for done, future in enumerate(as_completed(futures), start=1):
+        futures = {
+            executor.submit(transcribe, sample, clients[index % len(clients)]): sample
+            for index, sample in enumerate(samples)
+        }
+        for done, future in enumerate(as_completed(futures), start=len(previous) + 1):
             sample = futures[future]
             try:
                 hypothesis, duration = future.result()
@@ -219,13 +273,14 @@ def main(argv: list[str] | None = None) -> int:
                     "normalized_reference": " ".join(reference_words),
                     "normalized_hypothesis": " ".join(hypothesis_words),
                     "errors": utterance_errors,
+                    "duration": duration,
                 }
                 output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
                 output_file.flush()
 
-            if done == 1 or done % 25 == 0 or done == len(samples):
+            if done == len(previous) + 1 or done % 25 == 0 or done == total:
                 wer = errors / words * 100 if words else 0.0
-                print(f"Processed {done}/{len(samples)}  WER so far: {wer:.2f}%")
+                print(f"Processed {done}/{total}  WER so far: {wer:.2f}%")
                 sys.stdout.flush()
     except KeyboardInterrupt:
         print("\nInterrupted.")
@@ -242,10 +297,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"WER: {errors / words * 100:.2f}%")
     print(f"Word errors: {errors}")
     print(f"Reference words: {words}")
-    print(
-        f"Audio: {audio_seconds:.1f}s  Elapsed: {elapsed:.1f}s  "
-        f"RTFx: {audio_seconds / elapsed:.1f}"
-    )
+    if samples:
+        print(
+            f"Audio: {audio_seconds:.1f}s  Elapsed: {elapsed:.1f}s  "
+            f"RTFx: {audio_seconds / elapsed:.1f}"
+        )
     if args.output is not None:
         print(f"Predictions: {args.output}")
     return 0

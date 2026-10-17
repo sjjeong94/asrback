@@ -27,6 +27,15 @@ Endpoints:
 Supported response formats are `json`, `text`, `srt`, `vtt` and `verbose_json`.
 Audio longer than 30 seconds is decoded in 30-second windows.
 
+Concurrent requests are decoded together in batches. Options that affect speed:
+
+| Option | Default | |
+| --- | --- | --- |
+| `--dtype` | `float16` on CUDA, else `float32` | Model precision (`float32`, `float16`, `bfloat16`) |
+| `--max-batch-size` | `16` | Most requests decoded together |
+| `--batch-wait-ms` | `5` | How long a batch waits to fill |
+| `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Replay each decoder step from a captured CUDA graph |
+
 Any OpenAI client works against the server:
 
 ```python
@@ -58,17 +67,28 @@ uv run asrback-eval --base-url http://127.0.0.1:8000/v1
 ```
 
 Use `--limit N` for a quick run and `--output predictions.jsonl` to save per-utterance
-results. Text is normalized with Whisper's `EnglishTextNormalizer`
-(`pip install asrback[eval]`).
+results; add `--resume` to skip utterances already in that file. Text is normalized
+with Whisper's `EnglishTextNormalizer` (`pip install asrback[eval]`).
 
-| Model | Decoding | WER (test-clean) |
-| --- | --- | --- |
-| whisper-tiny | greedy | 7.54% |
-| whisper-tiny.en | greedy | 5.61% |
-| whisper-base | greedy | 5.00% |
-| whisper-base.en | greedy | 4.23% |
-| whisper-small | greedy | 3.39% |
-| whisper-small.en | greedy | 3.02% |
+For speed, keep `--concurrency` (default 32) above the server's `--max-batch-size` and
+pass `--sort-by-length` so similar-length files share a batch. `--base-url` can be
+repeated to spread requests over several servers.
+
+```bash
+uv run asrback-eval --base-url http://127.0.0.1:8000/v1 --sort-by-length
+```
+
+Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
+(5.4 hours of audio) with `--sort-by-length`:
+
+| Model | WER float16 | WER float32 | Time float16 | Time float32 |
+| --- | --- | --- | --- | --- |
+| whisper-tiny | 7.53% | 7.54% | 18.5 s | 33.0 s |
+| whisper-tiny.en | 5.56% | 5.62% | 18.7 s | 31.8 s |
+| whisper-base | 5.00% | 4.99% | 24.2 s | 51.9 s |
+| whisper-base.en | 4.25% | 4.23% | 23.8 s | 50.2 s |
+| whisper-small | 3.39% | 3.39% | 58.0 s | 150.9 s |
+| whisper-small.en | 3.02% | 3.03% | 57.8 s | 150.3 s |
 
 ## Limitations
 

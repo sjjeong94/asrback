@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -14,7 +16,6 @@ class MultiHeadAttention(nn.Module):
             raise ValueError(f"d_model ({width}) must be divisible by heads ({heads})")
         self.heads = heads
         self.head_dim = width // heads
-        self.scale = self.head_dim**-0.5
         self.k_proj = nn.Linear(width, width, bias=False)
         self.v_proj = nn.Linear(width, width)
         self.q_proj = nn.Linear(width, width)
@@ -24,41 +25,28 @@ class MultiHeadAttention(nn.Module):
         batch, length, width = x.shape
         return x.view(batch, length, self.heads, width // self.heads).transpose(1, 2)
 
-    def forward(
+    def project_key_value(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """``(batch, heads, length, head_dim)`` keys and values for ``x``."""
+        return self._split_heads(self.k_proj(x)), self._split_heads(self.v_proj(x))
+
+    def attend(
         self,
         x: Tensor,
-        key_value: Tensor | None = None,
-        cache: tuple[Tensor, Tensor] | None = None,
-        causal: bool = False,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        key: Tensor,
+        value: Tensor,
+        mask: Tensor | None = None,
+        is_causal: bool = False,
+    ) -> Tensor:
         query = self._split_heads(self.q_proj(x))
-        if key_value is not None:
-            if cache is None:
-                key = self._split_heads(self.k_proj(key_value))
-                value = self._split_heads(self.v_proj(key_value))
-            else:
-                key, value = cache
-        else:
-            key = self._split_heads(self.k_proj(x))
-            value = self._split_heads(self.v_proj(x))
-            if cache is not None:
-                key = torch.cat((cache[0], key), dim=2)
-                value = torch.cat((cache[1], value), dim=2)
+        output = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask, is_causal=is_causal
+        )
+        output = output.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1)
+        return self.out_proj(output)
 
-        scores = torch.matmul(query, key.transpose(-2, -1)) * self.scale
-        if causal:
-            query_length = query.shape[2]
-            key_length = key.shape[2]
-            past_length = key_length - query_length
-            query_positions = torch.arange(query_length, device=x.device) + past_length
-            key_positions = torch.arange(key_length, device=x.device)
-            mask = key_positions[None, :] > query_positions[:, None]
-            scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
-
-        attention = F.softmax(scores.float(), dim=-1).to(query.dtype)
-        output = torch.matmul(attention, value).transpose(1, 2).contiguous()
-        output = output.view(x.shape[0], x.shape[1], -1)
-        return self.out_proj(output), (key, value)
+    def forward(self, x: Tensor) -> Tensor:
+        """Unmasked self-attention."""
+        return self.attend(x, *self.project_key_value(x))
 
 
 class EncoderLayer(nn.Module):
@@ -72,12 +60,8 @@ class EncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(width)
 
     def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        x, _ = self.self_attn(self.self_attn_layer_norm(x))
-        x = residual + x
-        residual = x
-        x = self.fc2(F.gelu(self.fc1(self.final_layer_norm(x))))
-        return residual + x
+        x = x + self.self_attn(self.self_attn_layer_norm(x))
+        return x + self.fc2(F.gelu(self.fc1(self.final_layer_norm(x))))
 
 
 class WhisperEncoder(nn.Module):
@@ -106,7 +90,31 @@ class WhisperEncoder(nn.Module):
         return self.layer_norm(x)
 
 
-LayerCache = tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor]]
+@dataclass
+class DecoderCache:
+    """Preallocated keys and values, ``(layers, batch, heads, length, head_dim)``.
+
+    Self-attention entries are written in place at each step's positions, so the
+    tensors keep fixed addresses (as CUDA graphs require).
+    """
+
+    self_keys: Tensor
+    self_values: Tensor
+    cross_keys: Tensor
+    cross_values: Tensor
+
+    @property
+    def batch_size(self) -> int:
+        return self.self_keys.shape[1]
+
+    def narrow(self, batch_size: int) -> DecoderCache:
+        """A view of the first ``batch_size`` rows sharing the same storage."""
+        return DecoderCache(
+            self.self_keys[:, :batch_size],
+            self.self_values[:, :batch_size],
+            self.cross_keys[:, :batch_size],
+            self.cross_values[:, :batch_size],
+        )
 
 
 class DecoderLayer(nn.Module):
@@ -125,27 +133,28 @@ class DecoderLayer(nn.Module):
     def forward(
         self,
         x: Tensor,
-        encoder_output: Tensor,
-        cache: LayerCache | None,
-    ) -> tuple[Tensor, LayerCache]:
-        self_cache = None if cache is None else cache[0]
-        cross_cache = None if cache is None else cache[1]
+        cache: tuple[Tensor, Tensor, Tensor, Tensor],
+        positions: Tensor,
+        length: int | None,
+        mask: Tensor | None,
+    ) -> Tensor:
+        self_keys, self_values, cross_keys, cross_values = cache
 
-        residual = x
-        x, self_cache = self.self_attn(
-            self.self_attn_layer_norm(x), cache=self_cache, causal=True
+        hidden = self.self_attn_layer_norm(x)
+        key, value = self.self_attn.project_key_value(hidden)
+        self_keys.index_copy_(2, positions, key)
+        self_values.index_copy_(2, positions, value)
+        if length is not None:
+            # Eager: attend to the filled prefix; a multi-token input starts at 0.
+            self_keys = self_keys[:, :, :length]
+            self_values = self_values[:, :, :length]
+        x = x + self.self_attn.attend(
+            hidden, self_keys, self_values, mask=mask, is_causal=x.shape[1] > 1
         )
-        x = residual + x
-        residual = x
-        x, cross_cache = self.encoder_attn(
-            self.encoder_attn_layer_norm(x),
-            key_value=encoder_output,
-            cache=cross_cache,
-        )
-        x = residual + x
-        residual = x
-        x = self.fc2(F.gelu(self.fc1(self.final_layer_norm(x))))
-        return residual + x, (self_cache, cross_cache)
+
+        hidden = self.encoder_attn_layer_norm(x)
+        x = x + self.encoder_attn.attend(hidden, cross_keys, cross_values)
+        return x + self.fc2(F.gelu(self.fc1(self.final_layer_norm(x))))
 
 
 class WhisperDecoder(nn.Module):
@@ -160,23 +169,23 @@ class WhisperDecoder(nn.Module):
         self.layer_norm = nn.LayerNorm(width)
 
     def forward(
-        self,
-        tokens: Tensor,
-        encoder_output: Tensor,
-        caches: list[LayerCache] | None = None,
-    ) -> tuple[Tensor, list[LayerCache]]:
-        offset = 0 if caches is None else caches[0][0][0].shape[2]
-        end = offset + tokens.shape[1]
-        if end > self.embed_positions.num_embeddings:
-            raise ValueError("decoder input exceeds max_target_positions")
-        x = self.embed_tokens(tokens) + self.embed_positions.weight[offset:end]
-
-        new_caches = []
+        self, tokens: Tensor, positions: Tensor, cache: DecoderCache, length: int | None
+    ) -> Tensor:
+        x = self.embed_tokens(tokens) + self.embed_positions(positions)
+        mask = None
+        if length is None:
+            # Fixed-shape step over the whole cache: hide positions not yet written.
+            key_positions = torch.arange(cache.self_keys.shape[3], device=x.device)
+            mask = key_positions[None, :] <= positions[:, None]
         for index, layer in enumerate(self.layers):
-            cache = None if caches is None else caches[index]
-            x, new_cache = layer(x, encoder_output, cache)
-            new_caches.append(new_cache)
-        return self.layer_norm(x), new_caches
+            layer_cache = (
+                cache.self_keys[index],
+                cache.self_values[index],
+                cache.cross_keys[index],
+                cache.cross_values[index],
+            )
+            x = layer(x, layer_cache, positions, length, mask)
+        return self.layer_norm(x)
 
 
 class WhisperModel(nn.Module):
@@ -189,14 +198,50 @@ class WhisperModel(nn.Module):
 class WhisperForConditionalGeneration(nn.Module):
     def __init__(self, config: dict) -> None:
         super().__init__()
+        self.config = config
         self.model = WhisperModel(config)
+
+    def allocate_cache(self, batch_size: int) -> DecoderCache:
+        config = self.config
+        weight = self.model.decoder.embed_tokens.weight
+        heads = config["decoder_attention_heads"]
+        shape = (
+            config["decoder_layers"],
+            batch_size,
+            heads,
+            0,
+            config["d_model"] // heads,
+        )
+
+        def empty(length: int) -> Tensor:
+            size = shape[:3] + (length,) + shape[4:]
+            return torch.zeros(size, dtype=weight.dtype, device=weight.device)
+
+        target = config["max_target_positions"]
+        source = config["max_source_positions"]
+        return DecoderCache(empty(target), empty(target), empty(source), empty(source))
+
+    def set_encoder_output(self, cache: DecoderCache, encoder_output: Tensor) -> None:
+        """Fill the first ``len(encoder_output)`` rows' cross-attention keys/values."""
+        batch_size = encoder_output.shape[0]
+        for index, layer in enumerate(self.model.decoder.layers):
+            key, value = layer.encoder_attn.project_key_value(encoder_output)
+            cache.cross_keys[index, :batch_size] = key
+            cache.cross_values[index, :batch_size] = value
 
     def decode(
         self,
         tokens: Tensor,
-        encoder_output: Tensor,
-        caches: list[LayerCache] | None = None,
-    ) -> tuple[Tensor, list[LayerCache]]:
-        hidden, caches = self.model.decoder(tokens, encoder_output, caches)
-        logits = F.linear(hidden, self.model.decoder.embed_tokens.weight)
-        return logits, caches
+        positions: Tensor,
+        cache: DecoderCache,
+        length: int | None = None,
+    ) -> Tensor:
+        """Decoder hidden states for ``tokens`` at ``positions``.
+
+        ``length`` is the number of filled cache positions after this call, and
+        is ``None`` for a fixed-shape (CUDA graph) step that masks the full cache.
+        """
+        return self.model.decoder(tokens, positions, cache, length)
+
+    def logits(self, hidden: Tensor) -> Tensor:
+        return F.linear(hidden, self.model.decoder.embed_tokens.weight)
