@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
+from . import __version__
 from .models import SenseVoiceTranscriber, Transcriber
 from .transcription import Transcription
 
@@ -88,7 +89,7 @@ def create_app(
     transcriber: Transcriber | SenseVoiceTranscriber, model_name: str
 ) -> FastAPI:
     """Build the app. Requests may name any model; ``model_name`` is what we list."""
-    app = FastAPI(title="asrback")
+    app = FastAPI(title="asrback", version=__version__)
     created = int(time.time())
 
     @app.exception_handler(APIError)

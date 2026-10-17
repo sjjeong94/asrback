@@ -430,7 +430,7 @@ class Transcriber:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         if dtype is None:
-            dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+            dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         elif isinstance(dtype, str):
             dtype = DTYPES[dtype]
         self.dtype = dtype

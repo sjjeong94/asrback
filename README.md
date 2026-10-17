@@ -38,7 +38,7 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 
 | Option | Default | |
 | --- | --- | --- |
-| `--dtype` | `float16` on CUDA (SenseVoice: `bfloat16`), else `float32` | Model precision (`float32`, `float16`, `bfloat16`); SenseVoice overflows in `float16` |
+| `--dtype` | `bfloat16` on CUDA, else `float32` | Model precision (`float32`, `float16`, `bfloat16`); SenseVoice overflows in `float16` |
 | `--max-batch-size` | `16` | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
 | `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper: replay each decoder step from a captured CUDA graph |
@@ -99,31 +99,31 @@ uv run asrback-eval --base-url http://127.0.0.1:8000/v1 --sort-by-length
 Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 (5.4 hours of audio) with `--sort-by-length`:
 
-| Model | WER float16 | WER float32 | Time float16 | Time float32 |
-| --- | --- | --- | --- | --- |
-| whisper-tiny | 7.53% | 7.54% | 12.5 s | 24.7 s |
-| whisper-tiny.en | 5.56% | 5.62% | 12.0 s | 25.0 s |
-| whisper-base | 5.00% | 4.99% | 19.4 s | 45.6 s |
-| whisper-base.en | 4.25% | 4.23% | 18.9 s | 46.8 s |
-| whisper-small | 3.39% | 3.39% | 52.7 s | 144.3 s |
-| whisper-small.en | 3.02% | 3.03% | 52.3 s | 134.7 s |
-| whisper-large-v3-turbo | 2.11% | 2.10% | 160.3 s | 401.1 s |
-| sensevoice-small | 3.45% (bfloat16) | 3.45% | 16.8 s (bfloat16) | 18.7 s |
+| Model | WER float16 | WER bfloat16 | WER float32 | Time float16 | Time bfloat16 | Time float32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| whisper-tiny | 7.53% | 7.52% | 7.54% | 12.5 s | 12.9 s | 24.7 s |
+| whisper-tiny.en | 5.56% | 5.61% | 5.62% | 12.0 s | 11.6 s | 25.0 s |
+| whisper-base | 5.00% | 5.05% | 4.99% | 19.4 s | 20.7 s | 45.6 s |
+| whisper-base.en | 4.25% | 4.20% | 4.23% | 18.9 s | 19.1 s | 46.8 s |
+| whisper-small | 3.39% | 3.38% | 3.39% | 52.7 s | 54.9 s | 144.3 s |
+| whisper-small.en | 3.02% | 3.03% | 3.03% | 52.3 s | 52.3 s | 134.7 s |
+| whisper-large-v3-turbo | 2.11% | 2.07% | 2.10% | 160.3 s | 160.1 s | 401.1 s |
+| sensevoice-small | (overflows) | 3.45% | 3.45% | | 16.8 s | 18.7 s |
 
 `--compile-encoder` brings whisper-small to 49.3 s (small.en 50.2 s) at the cost of
 about 20 s more startup; it does not help tiny or base.
 
-FLEURS test, greedy decoding, float16 (SenseVoice: bfloat16):
+FLEURS test, greedy decoding, bfloat16:
 
 | Model | en_us WER | ko_kr CER | ja_jp CER |
 | --- | --- | --- | --- |
-| whisper-tiny | 15.65% | 17.48% | 44.67% |
-| whisper-tiny.en | 14.15% | | |
-| whisper-base | 12.94% | 14.39% | 25.28% |
-| whisper-base.en | 9.34% | | |
-| whisper-small | 8.39% | 5.81% | 12.84% |
-| whisper-small.en | 7.79% | | |
-| whisper-large-v3-turbo | 6.08% | 3.37% | 6.08% |
+| whisper-tiny | 15.82% | 17.65% | 43.67% |
+| whisper-tiny.en | 14.08% | | |
+| whisper-base | 12.84% | 13.89% | 25.12% |
+| whisper-base.en | 9.43% | | |
+| whisper-small | 8.31% | 5.83% | 12.90% |
+| whisper-small.en | 7.77% | | |
+| whisper-large-v3-turbo | 6.13% | 3.35% | 6.07% |
 | sensevoice-small | 9.05% | 6.61% | 7.55% |
 
 Smaller models sometimes repeat a phrase until the token limit, especially in
@@ -138,3 +138,9 @@ rates.
 - One model per server process.
 - English-only (`*.en`) and SenseVoice models support transcription only, not
   translation.
+
+## License
+
+The code is released under the [MIT License](LICENSE). Model weights are not part of
+this repository and keep their own licenses: Whisper (MIT) and SenseVoiceSmall (see its
+[model card](https://huggingface.co/FunAudioLLM/SenseVoiceSmall)).

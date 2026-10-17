@@ -34,8 +34,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dtype",
         choices=("float32", "float16", "bfloat16"),
         default=None,
-        help="Model precision. Default: float16 on CUDA (bfloat16 for SenseVoice), "
-        "otherwise float32",
+        help="Model precision. Default: bfloat16 on CUDA, otherwise float32",
     )
     parser.add_argument(
         "--max-batch-size",

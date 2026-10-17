@@ -1,8 +1,10 @@
 [project]
 name = "asrback"
-version = "0.1.0"
-description = "OpenAI-compatible speech-to-text server for Whisper SafeTensors checkpoints"
+dynamic = ["version"]
+description = "OpenAI-compatible speech-to-text server for Whisper and SenseVoice checkpoints"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "asrfront>=0.2.0",
@@ -28,8 +30,15 @@ asrback-client = "asrback.client:main"
 asrback-eval = "asrback.evaluation:main"
 
 [build-system]
-requires = ["uv_build>=0.8,<0.14"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+# The single source of the version is asrback.__version__.
+path = "src/asrback/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/asrback", "README.md", "LICENSE"]
 
 [dependency-groups]
 dev = [
