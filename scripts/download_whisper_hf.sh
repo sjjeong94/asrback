@@ -2,7 +2,8 @@
 # Download the Whisper files needed by asrback from Hugging Face.
 #
 # Usage: download_whisper_hf.sh [--tokenizer-only] [MODEL ...]
-#   MODEL: tiny, base, small, tiny.en, base.en, small.en (default: tiny base small)
+#   MODEL: tiny, base, small, tiny.en, base.en, small.en, large-v3-turbo
+#          (default: tiny base small)
 #   --tokenizer-only  Download only config/tokenizer files (skip model.safetensors).
 set -euo pipefail
 
@@ -14,9 +15,9 @@ MODELS=()
 for arg in "$@"; do
   case "$arg" in
     --tokenizer-only) FILES=(config.json tokenizer.json tokenizer_config.json) ;;
-    tiny|base|small|tiny.en|base.en|small.en) MODELS+=("$arg") ;;
+    tiny|base|small|tiny.en|base.en|small.en|large-v3-turbo) MODELS+=("$arg") ;;
     *)
-      echo "Error: unsupported argument '$arg' (expected --tokenizer-only, tiny, base, small, tiny.en, base.en, or small.en)." >&2
+      echo "Error: unsupported argument '$arg' (expected --tokenizer-only, tiny, base, small, tiny.en, base.en, small.en, or large-v3-turbo)." >&2
       exit 1
       ;;
   esac

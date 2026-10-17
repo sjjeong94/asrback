@@ -8,7 +8,7 @@ at runtime).
 
 ```bash
 uv sync
-scripts/download_whisper_hf.sh tiny   # -> models/whisper-tiny (tiny, base, small, *.en)
+scripts/download_whisper_hf.sh tiny   # -> models/whisper-tiny (tiny, base, small, *.en, large-v3-turbo)
 ```
 
 ## Server
@@ -100,6 +100,7 @@ Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 | whisper-base.en | 4.25% | 4.23% | 18.9 s | 46.8 s |
 | whisper-small | 3.39% | 3.39% | 52.7 s | 144.3 s |
 | whisper-small.en | 3.02% | 3.03% | 52.3 s | 134.7 s |
+| whisper-large-v3-turbo | 2.11% | 2.10% | 160.3 s | 401.1 s |
 
 `--compile-encoder` brings whisper-small to 49.3 s (small.en 50.2 s) at the cost of
 about 20 s more startup; it does not help tiny or base.
@@ -114,6 +115,7 @@ FLEURS test, greedy decoding, float16:
 | whisper-base.en | 9.34% | | |
 | whisper-small | 8.39% | 5.81% | 12.84% |
 | whisper-small.en | 7.79% | | |
+| whisper-large-v3-turbo | 6.08% | 3.37% | 6.08% |
 
 Smaller models sometimes repeat a phrase until the token limit, especially in
 Japanese; without temperature fallback (see below) these loops dominate their error
