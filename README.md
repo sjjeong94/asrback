@@ -39,7 +39,7 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 | Option | Default | |
 | --- | --- | --- |
 | `--dtype` | `bfloat16` on CUDA, else `float32` | Model precision (`float32`, `float16`, `bfloat16`); SenseVoice overflows in `float16` |
-| `--max-batch-size` | `16` | Most requests decoded together |
+| `--max-batch-size` | `16` (SenseVoice: `32`) | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
 | `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper: replay each decoder step from a captured CUDA graph |
 | `--compile-encoder` | off | Whisper: `torch.compile` the encoder; slower startup, faster for larger models |
@@ -88,9 +88,11 @@ results; add `--resume` to skip utterances already in that file. Text is normali
 with Whisper's `EnglishTextNormalizer` for English and `BasicTextNormalizer` otherwise
 (`pip install asrback[eval]`).
 
-For speed, keep `--concurrency` (default 32) above the server's `--max-batch-size` and
-pass `--sort-by-length` so similar-length files share a batch. `--base-url` can be
-repeated to spread requests over several servers.
+For speed, keep `--concurrency` (default 128) well above the server's
+`--max-batch-size` and pass `--sort-by-length` so similar-length files share a batch.
+The SenseVoice server also groups queued windows of similar length itself, which
+helps more the more requests are in flight. `--base-url` can be repeated to spread
+requests over several servers.
 
 ```bash
 uv run asrback-eval --base-url http://127.0.0.1:8000/v1 --sort-by-length
@@ -108,7 +110,7 @@ Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 | whisper-small | 3.39% | 3.38% | 3.39% | 52.7 s | 54.9 s | 144.3 s |
 | whisper-small.en | 3.02% | 3.03% | 3.03% | 52.3 s | 52.3 s | 134.7 s |
 | whisper-large-v3-turbo | 2.11% | 2.07% | 2.10% | 160.3 s | 160.1 s | 401.1 s |
-| sensevoice-small | (overflows) | 3.45% | 3.45% | | 16.8 s | 18.7 s |
+| sensevoice-small | (overflows) | 3.44% | 3.45% | | 11.9 s | 18.0 s |
 
 `--compile-encoder` brings whisper-small to 49.3 s (small.en 50.2 s) at the cost of
 about 20 s more startup; it does not help tiny or base.
@@ -124,7 +126,7 @@ FLEURS test, greedy decoding, bfloat16:
 | whisper-small | 8.31% | 5.83% | 12.90% |
 | whisper-small.en | 7.77% | | |
 | whisper-large-v3-turbo | 6.13% | 3.35% | 6.07% |
-| sensevoice-small | 9.05% | 6.61% | 7.55% |
+| sensevoice-small | 9.06% | 6.61% | 7.56% |
 
 Smaller models sometimes repeat a phrase until the token limit, especially in
 Japanese; without temperature fallback (see below) these loops dominate their error

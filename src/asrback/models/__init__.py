@@ -19,8 +19,10 @@ def load_transcriber(
     """Load the Whisper or SenseVoice checkpoint in ``model_dir``.
 
     ``options`` (device, dtype, max_batch_size, batch_wait_ms) apply to both;
-    ``cuda_graphs`` and ``compile_encoder`` to Whisper only.
+    ``cuda_graphs`` and ``compile_encoder`` to Whisper only. Options left as
+    ``None`` take the model's default.
     """
+    options = {name: value for name, value in options.items() if value is not None}
     if is_sensevoice(model_dir):
         if cuda_graphs or compile_encoder:
             raise ValueError(

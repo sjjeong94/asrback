@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Optional
 
+import anyio.to_thread
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -89,7 +91,17 @@ def create_app(
     transcriber: Transcriber | SenseVoiceTranscriber, model_name: str
 ) -> FastAPI:
     """Build the app. Requests may name any model; ``model_name`` is what we list."""
-    app = FastAPI(title="asrback", version=__version__)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Sync endpoints run in AnyIO's thread pool (40 threads by default) and each
+        # request holds a thread while it waits for its batch. Allow several batches'
+        # worth so the batcher can group windows of similar length.
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = max(limiter.total_tokens, 8 * transcriber.max_batch_size)
+        yield
+
+    app = FastAPI(title="asrback", version=__version__, lifespan=lifespan)
     created = int(time.time())
 
     @app.exception_handler(APIError)

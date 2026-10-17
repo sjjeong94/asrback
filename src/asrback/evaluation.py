@@ -71,9 +71,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=32,
-        help="Requests in flight at once; keep it above the server's batch size. "
-        "Default: 32",
+        default=128,
+        help="Requests in flight at once; keep it well above the server's batch "
+        "size. Default: 128",
     )
     parser.add_argument(
         "--sort-by-length",

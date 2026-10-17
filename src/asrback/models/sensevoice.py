@@ -37,6 +37,8 @@ SAMPLE_RATE = asrfront.sensevoice.SAMPLE_RATE
 WINDOW_SAMPLES = 30 * SAMPLE_RATE
 MIN_TAIL_SAMPLES = SAMPLE_RATE // 10
 HOP_LENGTH = 160  # 10 ms fbank frames, the unit of ``Segment.seek``
+# The worker picks each batch from up to this many batches' worth of queued windows.
+PENDING_FACTOR = 4
 
 REQUIRED_FILES = (
     "model.pt",
@@ -52,19 +54,6 @@ EVENT_QUERY, EMOTION_QUERY = 1, 2
 TEXT_NORM_QUERIES = {"withitn": 14, "woitn": 15}
 QUERY_COUNT = 4
 BLANK_ID = 0
-
-
-class LayerNorm(nn.LayerNorm):
-    """Layer norm computed in float32, as the checkpoint was trained."""
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.layer_norm(
-            x.float(),
-            self.normalized_shape,
-            self.weight.float(),
-            self.bias.float(),
-            self.eps,
-        ).type_as(x)
 
 
 class SANMAttention(nn.Module):
@@ -126,9 +115,9 @@ class EncoderLayer(nn.Module):
         self, in_size: int, size: int, heads: int, hidden: int, kernel_size: int
     ) -> None:
         super().__init__()
-        self.norm1 = LayerNorm(in_size)
+        self.norm1 = nn.LayerNorm(in_size)
         self.self_attn = SANMAttention(in_size, size, heads, kernel_size)
-        self.norm2 = LayerNorm(size)
+        self.norm2 = nn.LayerNorm(size)
         self.feed_forward = FeedForward(size, hidden)
         self.residual = in_size == size
 
@@ -171,8 +160,8 @@ class SenseVoiceEncoder(nn.Module):
             EncoderLayer(size, size, heads, hidden, kernel)
             for _ in range(config["tp_blocks"])
         )
-        self.after_norm = LayerNorm(size)
-        self.tp_norm = LayerNorm(size)
+        self.after_norm = nn.LayerNorm(size)
+        self.tp_norm = nn.LayerNorm(size)
 
     def forward(self, x: Tensor, mask: Tensor | None) -> Tensor:
         positions = sinusoidal_positions(x.shape[1], x.shape[2], x.device)
@@ -205,10 +194,19 @@ class SenseVoiceModel(nn.Module):
         self.embed = nn.Embedding(QUERY_EMBEDDINGS, input_size)
 
     def forward(self, features: Tensor, queries: Tensor, mask: Tensor | None) -> Tensor:
-        """CTC log-probabilities for ``queries`` (batch, 4) followed by ``features``."""
+        """CTC logits for ``queries`` (batch, 4) followed by ``features``."""
         x = torch.cat((self.embed(queries).to(features.dtype), features), dim=1)
-        hidden = self.encoder(x, mask)
-        return self.ctc.ctc_lo(hidden).float().log_softmax(dim=-1)
+        return self.ctc.ctc_lo(self.encoder(x, mask))
+
+
+def greedy_ctc(logits: Tensor, no_speech_id: int) -> tuple[Tensor, Tensor, Tensor]:
+    """Best token and its log-probability per frame, and P(<|nospeech|>) at the
+    first frame, without materializing float32 log-probabilities for the vocab."""
+    best_logits, best = logits.max(dim=-1)
+    normalizer = torch.logsumexp(logits, dim=-1).float()
+    best_log_probs = best_logits.float() - normalizer
+    no_speech = (logits[:, 0, no_speech_id].float() - normalizer[:, 0]).exp()
+    return best, best_log_probs, no_speech
 
 
 @dataclass
@@ -225,6 +223,23 @@ class _Result:
     text: str
     avg_logprob: float
     no_speech_prob: float
+
+
+def take_similar(pending: list[_Job], count: int) -> list[_Job]:
+    """Remove and return the oldest job plus up to ``count - 1`` others that pad
+    little against it: the longest jobs no longer than it first (they pad to its
+    length), then the shortest longer ones. The oldest job is always served."""
+    target = len(pending[0].features)
+
+    def padding_order(index: int) -> tuple[bool, int]:
+        length = len(pending[index].features)
+        return (length > target, abs(length - target))
+
+    order = sorted(range(len(pending)), key=padding_order)
+    chosen = set(order[:count])
+    jobs = [job for i, job in enumerate(pending) if i in chosen]
+    pending[:] = [job for i, job in enumerate(pending) if i not in chosen]
+    return jobs
 
 
 class SenseVoiceTranscriber:
@@ -244,7 +259,7 @@ class SenseVoiceTranscriber:
         model_dir: str | os.PathLike,
         device: str | None = None,
         dtype: str | torch.dtype | None = None,
-        max_batch_size: int = 16,
+        max_batch_size: int = 32,
         batch_wait_ms: float = 5.0,
         use_itn: bool = True,
     ):
@@ -383,8 +398,19 @@ class SenseVoiceTranscriber:
     def _serve(self) -> None:
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
+        pending: list[_Job] = []
         while True:
-            jobs = gather_batch(self._queue, self.max_batch_size, self.batch_wait)
+            if not pending:
+                pending = gather_batch(
+                    self._queue, self.max_batch_size, self.batch_wait
+                )
+            # Look at everything already queued so similar lengths share a batch.
+            while len(pending) < PENDING_FACTOR * self.max_batch_size:
+                try:
+                    pending.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            jobs = take_similar(pending, self.max_batch_size)
             try:
                 results = self._decode_batch(jobs)
             except BaseException as exc:
@@ -394,16 +420,31 @@ class SenseVoiceTranscriber:
             for job, result in zip(jobs, results):
                 job.future.set_result(result)
 
+    def _forward(
+        self, features: Tensor, queries: Tensor, lengths: Tensor, masked: bool
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Best token per frame, mean speech log-probability and P(no speech) per
+        row; ``lengths`` counts each row's feature frames."""
+        frames = torch.arange(QUERY_COUNT + features.shape[1], device=self.device)
+        ends = lengths + QUERY_COUNT
+        mask = frames[None, :] < ends[:, None] if masked else None
+        best, best_log_probs, no_speech = greedy_ctc(
+            self.model(features, queries, mask), self._no_speech_id
+        )
+        speech = (frames[None, :] >= QUERY_COUNT) & (frames[None, :] < ends[:, None])
+        avg_logprobs = (best_log_probs * speech).sum(dim=1) / lengths.clamp(min=1)
+        return best, avg_logprobs, no_speech
+
     @torch.inference_mode()
     def _decode_batch(self, jobs: list[_Job]) -> list[_Result]:
+        batch_size = len(jobs)
         lengths = [len(job.features) for job in jobs]
         longest = max(lengths)
         width = jobs[0].features.shape[1]
-        features = np.zeros((len(jobs), longest, width), dtype=np.float32)
+        features = np.zeros((batch_size, longest, width), dtype=np.float32)
         for row, job in enumerate(jobs):
             features[row, : len(job.features)] = job.features
-        features = torch.from_numpy(features).to(self.device, self.dtype)
-
+        features = torch.from_numpy(features)
         queries = torch.tensor(
             [
                 [
@@ -413,21 +454,19 @@ class SenseVoiceTranscriber:
                     self._text_norm,
                 ]
                 for job in jobs
-            ],
-            device=self.device,
+            ]
         )
-        mask = None
-        if min(lengths) != longest:
-            frames = torch.arange(QUERY_COUNT + longest, device=self.device)
-            totals = torch.tensor(lengths, device=self.device) + QUERY_COUNT
-            mask = frames[None, :] < totals[:, None]
-
-        log_probs = self.model(features, queries, mask)
-        best_log_probs, best = log_probs.max(dim=-1)
-        no_speech = log_probs[:, 0, self._no_speech_id].exp()
+        best, avg_logprobs, no_speech = self._forward(
+            features.to(self.device, self.dtype),
+            queries.to(self.device),
+            torch.tensor(lengths, device=self.device),
+            masked=min(lengths) != longest,
+        )
+        rows = best.tolist()
+        avg_logprobs = avg_logprobs.tolist()
+        no_speech = no_speech.tolist()
 
         results = []
-        rows = best.tolist()
         for row, length, job in zip(range(len(jobs)), lengths, jobs):
             frames = rows[row][: QUERY_COUNT + length]
             # Greedy CTC: merge repeats, then drop blanks.
@@ -446,10 +485,8 @@ class SenseVoiceTranscriber:
             )
             text_tokens = [token for token in tokens if token not in self._special_ids]
             text = self.tokenizer.decode(text_tokens).strip()
-            speech = best_log_probs[row, QUERY_COUNT : QUERY_COUNT + length]
-            avg_logprob = float(speech.mean()) if length else 0.0
             results.append(
-                _Result(language, text_tokens, text, avg_logprob, float(no_speech[row]))
+                _Result(language, text_tokens, text, avg_logprobs[row], no_speech[row])
             )
         return results
 

@@ -39,8 +39,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-batch-size",
         type=int,
-        default=16,
-        help="Most concurrent requests decoded together. Default: 16",
+        default=None,
+        help="Most concurrent requests decoded together. "
+        "Default: 16 for Whisper, 32 for SenseVoice",
     )
     parser.add_argument(
         "--batch-wait-ms",
@@ -62,7 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=8000, help="Default: 8000")
     args = parser.parse_args(argv)
-    if args.max_batch_size <= 0:
+    if args.max_batch_size is not None and args.max_batch_size <= 0:
         parser.error("--max-batch-size must be greater than zero")
     if args.batch_wait_ms < 0:
         parser.error("--batch-wait-ms must be non-negative")
