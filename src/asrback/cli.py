@@ -1,4 +1,5 @@
-"""``asrback`` command: serve a Whisper checkpoint over the OpenAI audio API."""
+"""``asrback`` command: serve a Whisper or SenseVoice checkpoint over the OpenAI
+audio API."""
 
 from __future__ import annotations
 
@@ -9,13 +10,15 @@ from pathlib import Path
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="asrback",
-        description="Serve a Whisper model through OpenAI-compatible /v1/audio endpoints.",
+        description="Serve a Whisper or SenseVoice model through OpenAI-compatible "
+        "/v1/audio endpoints.",
     )
     parser.add_argument(
         "--model-dir",
         type=Path,
         default=Path("models/whisper-tiny"),
-        help="Directory containing model.safetensors and tokenizer/config JSON files.",
+        help="Whisper directory (model.safetensors and tokenizer/config JSON files) "
+        "or SenseVoice directory (model.pt, config.yaml, am.mvn, BPE model).",
     )
     parser.add_argument(
         "--model-name",
@@ -31,7 +34,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dtype",
         choices=("float32", "float16", "bfloat16"),
         default=None,
-        help="Model precision. Default: float16 on CUDA, otherwise float32",
+        help="Model precision. Default: float16 on CUDA (bfloat16 for SenseVoice), "
+        "otherwise float32",
     )
     parser.add_argument(
         "--max-batch-size",
@@ -72,21 +76,32 @@ def main(argv: list[str] | None = None) -> int:
     import torch
     import uvicorn
 
+    from .sensevoice import SenseVoiceTranscriber, is_sensevoice
     from .server import create_app
     from .transcriber import Transcriber
 
     # TF32 matmuls on Ampere+ GPUs; no effect on CPU or half precision.
     torch.set_float32_matmul_precision("high")
+    options = {
+        "device": args.device,
+        "dtype": args.dtype,
+        "max_batch_size": args.max_batch_size,
+        "batch_wait_ms": args.batch_wait_ms,
+    }
     try:
-        transcriber = Transcriber(
-            args.model_dir,
-            device=args.device,
-            dtype=args.dtype,
-            max_batch_size=args.max_batch_size,
-            batch_wait_ms=args.batch_wait_ms,
-            cuda_graphs=args.cuda_graphs,
-            compile_encoder=args.compile_encoder,
-        )
+        if is_sensevoice(args.model_dir):
+            if args.cuda_graphs or args.compile_encoder:
+                raise ValueError(
+                    "--cuda-graphs and --compile-encoder apply to Whisper models only"
+                )
+            transcriber = SenseVoiceTranscriber(args.model_dir, **options)
+        else:
+            transcriber = Transcriber(
+                args.model_dir,
+                cuda_graphs=args.cuda_graphs,
+                compile_encoder=args.compile_encoder,
+                **options,
+            )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     model_name = args.model_name or args.model_dir.resolve().name

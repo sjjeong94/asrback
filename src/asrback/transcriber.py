@@ -106,6 +106,22 @@ def compression_ratio(text: str) -> float:
     return len(data) / len(zlib.compress(data)) if data else 0.0
 
 
+def gather_batch(jobs: queue.SimpleQueue, max_size: int, wait: float) -> list:
+    """Block for one job, then take more until ``max_size`` or ``wait`` seconds."""
+    batch = [jobs.get()]
+    deadline = time.monotonic() + wait
+    while len(batch) < max_size:
+        remaining = deadline - time.monotonic()
+        try:
+            if remaining > 0:
+                batch.append(jobs.get(timeout=remaining))
+            else:
+                batch.append(jobs.get_nowait())
+        except queue.Empty:
+            break
+    return batch
+
+
 @dataclass
 class _Job:
     """One 30-second window waiting to be decoded."""
@@ -435,17 +451,7 @@ class Transcriber:
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
         while True:
-            jobs = [self._queue.get()]
-            deadline = time.monotonic() + self.batch_wait
-            while len(jobs) < self.max_batch_size:
-                remaining = deadline - time.monotonic()
-                try:
-                    if remaining > 0:
-                        jobs.append(self._queue.get(timeout=remaining))
-                    else:
-                        jobs.append(self._queue.get_nowait())
-                except queue.Empty:
-                    break
+            jobs = gather_batch(self._queue, self.max_batch_size, self.batch_wait)
 
             # Rows of a batch must share the prefix length and token budget.
             groups: dict[tuple[int, int], list[_Job]] = {}

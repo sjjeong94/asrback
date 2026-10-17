@@ -1,21 +1,28 @@
 # asrback
 
 OpenAI-compatible speech-to-text server for Whisper checkpoints in Hugging Face
-SafeTensors format, implemented in plain PyTorch (no `transformers` or `openai-whisper`
-at runtime).
+SafeTensors format and for FunASR's SenseVoiceSmall, implemented in plain PyTorch (no
+`transformers`, `openai-whisper` or `funasr` at runtime).
 
 ## Setup
 
 ```bash
 uv sync
 scripts/download_whisper_hf.sh tiny   # -> models/whisper-tiny (tiny, base, small, *.en, large-v3-turbo)
+scripts/download_sensevoice_hf.sh     # -> models/sensevoice-small
 ```
 
 ## Server
 
 ```bash
 uv run asrback --model-dir models/whisper-tiny --port 8000
+uv run asrback --model-dir models/sensevoice-small --port 8000
 ```
+
+The model type is detected from the directory. SenseVoice transcribes Chinese,
+English, Cantonese, Japanese and Korean (`zh`, `en`, `yue`, `ja`, `ko`) with greedy
+CTC decoding: it does not translate, and `prompt` and `temperature` have no effect.
+Its output includes punctuation and inverse text normalization.
 
 Endpoints:
 
@@ -31,11 +38,11 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 
 | Option | Default | |
 | --- | --- | --- |
-| `--dtype` | `float16` on CUDA, else `float32` | Model precision (`float32`, `float16`, `bfloat16`) |
+| `--dtype` | `float16` on CUDA (SenseVoice: `bfloat16`), else `float32` | Model precision (`float32`, `float16`, `bfloat16`); SenseVoice overflows in `float16` |
 | `--max-batch-size` | `16` | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
-| `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Replay each decoder step from a captured CUDA graph |
-| `--compile-encoder` | off | `torch.compile` the encoder; slower startup, faster for larger models |
+| `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper: replay each decoder step from a captured CUDA graph |
+| `--compile-encoder` | off | Whisper: `torch.compile` the encoder; slower startup, faster for larger models |
 
 Any OpenAI client works against the server:
 
@@ -101,11 +108,12 @@ Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 | whisper-small | 3.39% | 3.39% | 52.7 s | 144.3 s |
 | whisper-small.en | 3.02% | 3.03% | 52.3 s | 134.7 s |
 | whisper-large-v3-turbo | 2.11% | 2.10% | 160.3 s | 401.1 s |
+| sensevoice-small | 3.45% (bfloat16) | 3.45% | 16.8 s (bfloat16) | 18.7 s |
 
 `--compile-encoder` brings whisper-small to 49.3 s (small.en 50.2 s) at the cost of
 about 20 s more startup; it does not help tiny or base.
 
-FLEURS test, greedy decoding, float16:
+FLEURS test, greedy decoding, float16 (SenseVoice: bfloat16):
 
 | Model | en_us WER | ko_kr CER | ja_jp CER |
 | --- | --- | --- | --- |
@@ -116,6 +124,7 @@ FLEURS test, greedy decoding, float16:
 | whisper-small | 8.39% | 5.81% | 12.84% |
 | whisper-small.en | 7.79% | | |
 | whisper-large-v3-turbo | 6.08% | 3.37% | 6.08% |
+| sensevoice-small | 9.05% | 6.61% | 7.55% |
 
 Smaller models sometimes repeat a phrase until the token limit, especially in
 Japanese; without temperature fallback (see below) these loops dominate their error
@@ -127,4 +136,5 @@ rates.
   on repetitive output.
 - No word-level timestamps; segments are fixed 30-second windows.
 - One model per server process.
-- English-only (`*.en`) models support transcription only, not translation.
+- English-only (`*.en`) and SenseVoice models support transcription only, not
+  translation.
