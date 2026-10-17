@@ -13,7 +13,7 @@ dependencies = [
     "safetensors",
     "tokenizers",
     "torch",
-    "uvicorn",
+    "uvicorn[standard]",
 ]
 
 [project.optional-dependencies]

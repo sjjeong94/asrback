@@ -35,6 +35,7 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 | `--max-batch-size` | `16` | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
 | `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Replay each decoder step from a captured CUDA graph |
+| `--compile-encoder` | off | `torch.compile` the encoder; slower startup, faster for larger models |
 
 Any OpenAI client works against the server:
 
@@ -83,12 +84,15 @@ Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 
 | Model | WER float16 | WER float32 | Time float16 | Time float32 |
 | --- | --- | --- | --- | --- |
-| whisper-tiny | 7.53% | 7.54% | 18.5 s | 33.0 s |
-| whisper-tiny.en | 5.56% | 5.62% | 18.7 s | 31.8 s |
-| whisper-base | 5.00% | 4.99% | 24.2 s | 51.9 s |
-| whisper-base.en | 4.25% | 4.23% | 23.8 s | 50.2 s |
-| whisper-small | 3.39% | 3.39% | 58.0 s | 150.9 s |
-| whisper-small.en | 3.02% | 3.03% | 57.8 s | 150.3 s |
+| whisper-tiny | 7.53% | 7.54% | 12.5 s | 24.7 s |
+| whisper-tiny.en | 5.56% | 5.62% | 12.0 s | 25.0 s |
+| whisper-base | 5.00% | 4.99% | 19.4 s | 45.6 s |
+| whisper-base.en | 4.25% | 4.23% | 18.9 s | 46.8 s |
+| whisper-small | 3.39% | 3.39% | 52.7 s | 144.3 s |
+| whisper-small.en | 3.02% | 3.03% | 52.3 s | 134.7 s |
+
+`--compile-encoder` brings whisper-small to 49.3 s (small.en 50.2 s) at the cost of
+about 20 s more startup; it does not help tiny or base.
 
 ## Limitations
 

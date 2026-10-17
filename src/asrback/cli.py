@@ -51,6 +51,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Replay decoder steps from captured CUDA graphs. Default: on for CUDA",
     )
+    parser.add_argument(
+        "--compile-encoder",
+        action="store_true",
+        help="Compile the encoder with torch.compile (slower startup).",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=8000, help="Default: 8000")
     args = parser.parse_args(argv)
@@ -80,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             max_batch_size=args.max_batch_size,
             batch_wait_ms=args.batch_wait_ms,
             cuda_graphs=args.cuda_graphs,
+            compile_encoder=args.compile_encoder,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

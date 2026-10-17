@@ -107,11 +107,12 @@ class DecoderCache:
     def batch_size(self) -> int:
         return self.self_keys.shape[1]
 
-    def narrow(self, batch_size: int) -> DecoderCache:
-        """A view of the first ``batch_size`` rows sharing the same storage."""
+    def narrow(self, batch_size: int, length: int | None = None) -> DecoderCache:
+        """A view of the first ``batch_size`` rows (and self-attention positions)
+        sharing the same storage."""
         return DecoderCache(
-            self.self_keys[:, :batch_size],
-            self.self_values[:, :batch_size],
+            self.self_keys[:, :batch_size, :, :length],
+            self.self_values[:, :batch_size, :, :length],
             self.cross_keys[:, :batch_size],
             self.cross_values[:, :batch_size],
         )

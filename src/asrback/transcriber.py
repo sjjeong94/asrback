@@ -17,7 +17,7 @@ import zlib
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import Callable, Union
 
 import asrfront
 import numpy as np
@@ -35,6 +35,10 @@ SAMPLE_RATE = asrfront.whisper.SAMPLE_RATE
 WINDOW_SAMPLES = asrfront.whisper.N_SAMPLES
 # Trailing windows shorter than this are mostly padding and invite hallucinations.
 MIN_TAIL_SAMPLES = SAMPLE_RATE // 10
+# With CUDA graphs, decoder steps run this many at a time between EOS checks.
+EOS_CHECK_INTERVAL = 4
+# Self-attention lengths with their own CUDA graph, besides max_target_positions.
+KV_BUCKETS = (64, 128, 256)
 
 DTYPES = {
     "float32": torch.float32,
@@ -123,39 +127,60 @@ class _Result:
     no_speech_prob: float
 
 
-class _GraphStep:
-    """One decoder step for a fixed batch size, captured as a CUDA graph.
+@dataclass
+class _DecodeState:
+    """Per-row decoding state, updated in place by every step.
 
-    Inputs are read from ``tokens`` and ``position`` and the step writes into
-    ``cache`` in place; :meth:`replay` returns float32 logits for the new token.
+    ``position`` holds the position of ``tokens`` (the latest token); a step
+    writes its new token to ``generated`` at ``position + 1``.
     """
 
-    def __init__(
-        self,
-        model: WhisperForConditionalGeneration,
-        cache: DecoderCache,
-        tokens: Tensor,
-        position: Tensor,
-    ) -> None:
-        def step() -> Tensor:
-            hidden = model.decode(tokens, position, cache)
-            return model.logits(hidden[:, -1]).float()
+    tokens: Tensor  # (batch, 1)
+    position: Tensor  # (1,)
+    finished: Tensor  # (batch,)
+    sum_logprobs: Tensor  # (batch,)
+    generated: Tensor  # (batch, max_target_positions)
 
+    @classmethod
+    def allocate(
+        cls, batch_size: int, max_target: int, device: torch.device
+    ) -> _DecodeState:
+        return cls(
+            torch.zeros((batch_size, 1), dtype=torch.long, device=device),
+            torch.zeros(1, dtype=torch.long, device=device),
+            torch.zeros(batch_size, dtype=torch.bool, device=device),
+            torch.zeros(batch_size, device=device),
+            torch.zeros((batch_size, max_target), dtype=torch.long, device=device),
+        )
+
+    def narrow(self, batch_size: int) -> _DecodeState:
+        return _DecodeState(
+            self.tokens[:batch_size],
+            self.position,
+            self.finished[:batch_size],
+            self.sum_logprobs[:batch_size],
+            self.generated[:batch_size],
+        )
+
+
+class _Graph:
+    """A function of fixed-address tensors captured once as a CUDA graph."""
+
+    def __init__(self, function: Callable[[], None]) -> None:
         # Warm up on a side stream so lazy initialization stays out of the graph.
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
-                step()
+                function()
         torch.cuda.current_stream().wait_stream(stream)
 
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
-            self.logits = step()
+            function()
 
-    def replay(self) -> Tensor:
+    def replay(self) -> None:
         self.graph.replay()
-        return self.logits
 
 
 class Transcriber:
@@ -165,6 +190,8 @@ class Transcriber:
     batches of up to ``max_batch_size``, waiting at most ``batch_wait_ms`` for a
     batch to fill. ``cuda_graphs`` (default: on for CUDA) replays each decoder step
     from a captured graph instead of launching its kernels one by one.
+    ``compile_encoder`` compiles the encoder with ``torch.compile`` for every
+    batch size up front, which slows startup.
     """
 
     def __init__(
@@ -175,6 +202,7 @@ class Transcriber:
         max_batch_size: int = 16,
         batch_wait_ms: float = 5.0,
         cuda_graphs: bool | None = None,
+        compile_encoder: bool = False,
     ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
@@ -256,8 +284,18 @@ class Transcriber:
             }
             | {max_batch_size}
         )
+        self._kv_buckets = sorted(
+            {size for size in KV_BUCKETS if size < self.config["max_target_positions"]}
+            | {self.config["max_target_positions"]}
+        )
+        self._eos = self.config["eos_token_id"]
+        self._encoder = self.model.model.encoder
+        self.compile_encoder = compile_encoder
+        if compile_encoder:
+            self._compile_encoder()
         self._cache: DecoderCache | None = None
-        self._graphs: dict[int, _GraphStep] = {}
+        self._state: _DecodeState | None = None
+        self._graphs: dict[tuple[int, int], _Graph] = {}
         if self.cuda_graphs:
             self._capture_graphs()
 
@@ -352,21 +390,45 @@ class Transcriber:
         return windows
 
     @torch.inference_mode()
+    def _compile_encoder(self) -> None:
+        # Static shapes: batches are padded to a bucket, each compiled here once.
+        self._encoder = torch.compile(self.model.model.encoder, dynamic=False)
+        frames = 2 * self.config["max_source_positions"]
+        for batch_size in self._buckets:
+            mel = torch.zeros(
+                (batch_size, self.config["num_mel_bins"], frames),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._encoder(mel)
+
+    def _encode(self, log_mels: list[np.ndarray]) -> Tensor:
+        mel = torch.from_numpy(np.stack(log_mels)).to(self.device, self.dtype)
+        if not self.compile_encoder:
+            return self._encoder(mel)
+        batch_size = len(log_mels)
+        bucket = next(size for size in self._buckets if size >= batch_size)
+        padding = mel.new_zeros((bucket - batch_size,) + mel.shape[1:])
+        return self._encoder(torch.cat((mel, padding)))[:batch_size]
+
+    @torch.inference_mode()
     def _capture_graphs(self) -> None:
         if self.device.index is not None:
             torch.cuda.set_device(self.device)
         self._cache = self.model.allocate_cache(self.max_batch_size)
-        self._step_tokens = torch.zeros(
-            (self.max_batch_size, 1), dtype=torch.long, device=self.device
+        self._state = _DecodeState.allocate(
+            self.max_batch_size, self.config["max_target_positions"], self.device
         )
-        self._step_position = torch.zeros(1, dtype=torch.long, device=self.device)
+        # One greedy step per (batch size, self-attention length) pair.
         for batch_size in self._buckets:
-            self._graphs[batch_size] = _GraphStep(
-                self.model,
-                self._cache.narrow(batch_size),
-                self._step_tokens[:batch_size],
-                self._step_position,
-            )
+            state = self._state.narrow(batch_size)
+            for length in self._kv_buckets:
+                cache = self._cache.narrow(batch_size, length)
+                # Warm-up steps advance the position; keep them inside ``length``.
+                self._state.position.zero_()
+                self._graphs[batch_size, length] = _Graph(
+                    lambda state=state, cache=cache: self._step(state, cache)
+                )
 
     def _serve(self) -> None:
         """Worker loop: gather queued windows into batches and decode them."""
@@ -417,16 +479,17 @@ class Transcriber:
         self, jobs: list[_Job], prefix_length: int, limit: int
     ) -> list[_Result]:
         batch_size = len(jobs)
-        mel = torch.from_numpy(np.stack([job.log_mel for job in jobs]))
-        encoder_output = self.model.model.encoder(mel.to(self.device, self.dtype))
+        encoder_output = self._encode([job.log_mel for job in jobs])
 
-        graph = None
         if self.cuda_graphs:
             bucket = next(size for size in self._buckets if size >= batch_size)
-            graph = self._graphs[bucket]
         elif self._cache is None or self._cache.batch_size < batch_size:
             self._cache = self.model.allocate_cache(batch_size)
+            self._state = _DecodeState.allocate(
+                batch_size, self.config["max_target_positions"], self.device
+            )
         cache = self._cache.narrow(batch_size)
+        state = self._state.narrow(batch_size)
         self.model.set_encoder_output(cache, encoder_output)
 
         languages = [job.language for job in jobs]
@@ -449,62 +512,78 @@ class Transcriber:
             no_speech_probs = logits[:, 0].softmax(dim=-1)[:, self.no_speech_id]
         else:
             no_speech_probs = torch.zeros(batch_size, device=self.device)
-        next_logits = logits[:, 1]
 
-        temperatures = torch.tensor(
-            [job.temperature for job in jobs], device=self.device
-        )
-        sampling = any(job.temperature > 0 for job in jobs)
-        eos = self.config["eos_token_id"]
-        generated = torch.empty(
-            (batch_size, limit), dtype=torch.long, device=self.device
-        )
-        sum_logprobs = torch.zeros(batch_size, device=self.device)
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        temperatures = None
+        if any(job.temperature > 0 for job in jobs):
+            temperatures = torch.tensor(
+                [job.temperature for job in jobs], device=self.device
+            )
+        state.position.fill_(prefix_length - 1)
+        state.finished.zero_()
+        state.sum_logprobs.zero_()
+        self._select(logits[:, 1], state, self._first_suppress, temperatures)
+        steps = 1
 
-        steps = 0
-        for step in range(limit):
-            suppress = self._first_suppress if step == 0 else self._suppress
-            next_logits.masked_fill_(suppress, -math.inf)
-            token = next_logits.argmax(dim=-1)
-            if sampling:
-                scaled = next_logits / temperatures.clamp(min=1e-6)[:, None]
-                sampled = torch.multinomial(F.softmax(scaled, dim=-1), 1).squeeze(1)
-                token = torch.where(temperatures > 0, sampled, token)
-            logprob = F.log_softmax(next_logits, dim=-1).gather(1, token[:, None])
-            # Rows that already ended keep decoding padding; ignore their scores.
-            sum_logprobs += logprob.squeeze(1).masked_fill(finished, 0.0)
-            generated[:, step] = token
-            finished |= token == eos
-            steps = step + 1
-            # The only host synchronization per step.
-            if steps == limit or bool(finished.all()):
-                break
-
-            position = prefix_length + step
-            if graph is not None:
-                self._step_tokens[:batch_size, 0].copy_(token)
-                self._step_position.fill_(position)
-                next_logits = graph.replay()[:batch_size]
-            else:
-                hidden = self.model.decode(
-                    token[:, None],
-                    self._positions[position : position + 1],
-                    cache,
-                    length=position + 1,
-                )
-                next_logits = self.model.logits(hidden[:, -1]).float()
+        if self.cuda_graphs and temperatures is None:
+            # Graph steps advance the state on their own; the host only checks
+            # for EOS between groups of steps. Rows past ``batch_size`` are padding.
+            while steps < limit and not bool(state.finished.all()):
+                count = min(EOS_CHECK_INTERVAL, limit - steps)
+                length = prefix_length + steps + count - 1
+                kv_bucket = next(size for size in self._kv_buckets if size >= length)
+                graph = self._graphs[bucket, kv_bucket]
+                for _ in range(count):
+                    graph.replay()
+                steps += count
+        else:
+            while steps < limit and not bool(state.finished.all()):
+                self._step(state, cache, prefix_length + steps, temperatures)
+                steps += 1
 
         results = []
-        rows = generated[:, :steps].tolist()
+        end = prefix_length + steps
+        rows = state.generated[:, prefix_length:end].tolist()
         for row, language, sum_logprob, no_speech_prob in zip(
-            rows, languages, sum_logprobs.tolist(), no_speech_probs.tolist()
+            rows, languages, state.sum_logprobs.tolist(), no_speech_probs.tolist()
         ):
-            if eos in row:
-                row = row[: row.index(eos)]
+            if self._eos in row:
+                row = row[: row.index(self._eos)]
             avg_logprob = sum_logprob / (len(row) + 1)
             results.append(_Result(language, row, avg_logprob, no_speech_prob))
         return results
+
+    def _step(
+        self,
+        state: _DecodeState,
+        cache: DecoderCache,
+        length: int | None = None,
+        temperatures: Tensor | None = None,
+    ) -> None:
+        """Decode ``state.tokens`` and select the next token for every row."""
+        hidden = self.model.decode(state.tokens, state.position, cache, length)
+        logits = self.model.logits(hidden[:, -1]).float()
+        self._select(logits, state, self._suppress, temperatures)
+
+    def _select(
+        self,
+        logits: Tensor,
+        state: _DecodeState,
+        suppress: Tensor,
+        temperatures: Tensor | None,
+    ) -> None:
+        logits.masked_fill_(suppress, -math.inf)
+        token = logits.argmax(dim=-1)
+        if temperatures is not None:
+            scaled = logits / temperatures.clamp(min=1e-6)[:, None]
+            sampled = torch.multinomial(F.softmax(scaled, dim=-1), 1).squeeze(1)
+            token = torch.where(temperatures > 0, sampled, token)
+        logprob = F.log_softmax(logits, dim=-1).gather(1, token[:, None]).squeeze(1)
+        # Rows that already ended keep decoding padding; ignore their scores.
+        state.sum_logprobs.add_(logprob.masked_fill(state.finished, 0.0))
+        state.finished.logical_or_(token == self._eos)
+        state.position.add_(1)
+        state.generated.index_copy_(1, state.position, token[:, None])
+        state.tokens.copy_(token[:, None])
 
     def _detect_languages(self, cache: DecoderCache, batch_size: int) -> list[str]:
         if not self.multilingual:
