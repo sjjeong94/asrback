@@ -60,6 +60,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Compile the encoder with torch.compile (slower startup).",
     )
+    parser.add_argument(
+        "--condition-on-previous-text",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Condition each 30-second window on the text before it. With "
+        "--no-condition-on-previous-text, the windows of a long file are decoded "
+        "together. Default: on",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=8000, help="Default: 8000")
     args = parser.parse_args(argv)
@@ -90,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_wait_ms=args.batch_wait_ms,
             cuda_graphs=args.cuda_graphs,
             compile_encoder=args.compile_encoder,
+            condition_on_previous_text=args.condition_on_previous_text,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

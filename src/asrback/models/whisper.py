@@ -400,7 +400,9 @@ class Transcriber:
     batch to fill. ``cuda_graphs`` (default: on for CUDA) replays each decoder step
     from a captured graph instead of launching its kernels one by one.
     ``compile_encoder`` compiles the encoder with ``torch.compile`` for every
-    batch size up front, which slows startup.
+    batch size up front, which slows startup. With ``condition_on_previous_text``
+    off, a window sees only the prompt instead of the text before it, so the
+    windows of one recording are decoded together.
     """
 
     def __init__(
@@ -412,6 +414,7 @@ class Transcriber:
         batch_wait_ms: float = 5.0,
         cuda_graphs: bool | None = None,
         compile_encoder: bool = False,
+        condition_on_previous_text: bool = True,
     ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
@@ -441,6 +444,7 @@ class Transcriber:
         self.cuda_graphs = cuda_graphs
         self.max_batch_size = max_batch_size
         self.batch_wait = batch_wait_ms / 1000
+        self.condition_on_previous_text = condition_on_previous_text
 
         model = WhisperForConditionalGeneration(self.config)
         state_dict = load_file(str(model_dir / "model.safetensors"), device="cpu")
@@ -548,20 +552,36 @@ class Transcriber:
             history = self.tokenizer.encode(
                 " " + prompt.strip(), add_special_tokens=False
             ).ids
-        max_target = self.config["max_target_positions"]
+        # Like openai-whisper, earlier text fills at most half the context.
+        context = self.config["max_target_positions"] // 2 - 1
 
-        segments = []
-        # Windows are decoded in order: each one is conditioned on earlier text.
-        for seek, length, log_mel in self._windows(waveform):
-            # Condition on earlier text like openai-whisper: at most half the context.
-            previous = history[-(max_target // 2 - 1) :]
+        def submit(log_mel: np.ndarray, previous: list[int]) -> Future:
             job = _Job(log_mel, previous, language, task, temperature, max_new_tokens)
             self._queue.put(job)
-            result: _Result = job.future.result()
-            language = result.language
+            return job.future
 
+        windows = self._windows(waveform)
+        results: list[_Result] = []
+        if self.condition_on_previous_text:
+            # Windows are decoded in order: each one is conditioned on earlier text.
+            for _, _, log_mel in windows:
+                result = submit(log_mel, history[-context:]).result()
+                language = result.language
+                history.extend(result.tokens)
+                results.append(result)
+        else:
+            # Windows share only the prompt and the language, which the first window
+            # detects when not given; the rest are queued at once to share batches.
+            log_mels = [log_mel for _, _, log_mel in windows]
+            if language is None:
+                results.append(submit(log_mels.pop(0), history[-context:]).result())
+                language = results[0].language
+            futures = [submit(log_mel, history[-context:]) for log_mel in log_mels]
+            results.extend(future.result() for future in futures)
+
+        segments = []
+        for (seek, length, _), result in zip(windows, results):
             text = self.tokenizer.decode(result.tokens, skip_special_tokens=True)
-            history.extend(result.tokens)
             segments.append(
                 Segment(
                     id=len(segments),

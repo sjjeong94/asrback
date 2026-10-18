@@ -184,6 +184,9 @@ flowchart TD
 - **Window order**: windows are queued **one at a time**, because each window is conditioned on the
   text of the previous ones (`history`). As in openai-whisper, at most half the context
   (`max_target_positions // 2 - 1` tokens) is carried over. A `prompt` seeds `history`.
+- **`--no-condition-on-previous-text`**: every window gets only the `prompt` as previous text, so all
+  windows have the same prefix length and are queued at once to share batches. When no language is
+  given, the first window is decoded alone to detect it, then the rest are queued.
 - **Language**: the language detected in the first window is used for the rest.
 - **Segments**: one `Segment` per window. `start` and `end` are the window bounds in seconds, and
   `compression_ratio` is the zlib compression ratio of the text.
@@ -403,12 +406,12 @@ the results.
 
 | Item | Whisper | SenseVoice |
 | --- | --- | --- |
-| dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU); float16 refused |
+| dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) |
 | `max_batch_size` | 16 | 32 |
 | `batch_wait_ms` | 5 | 5 |
 | CUDA graphs | on with CUDA (decoder steps) | none |
 | `--compile-encoder` | off (optional) | not supported |
-| Windows | 30 s windows in order, each conditioned on earlier text | 30 s windows all at once |
+| Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once |
 | Decoding | greedy or temperature sampling | greedy CTC |
 | Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 |
 | Eval concurrency | 128 | 128 |
