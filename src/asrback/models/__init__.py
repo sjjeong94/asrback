@@ -19,18 +19,21 @@ def load_transcriber(
 ) -> Transcriber | SenseVoiceTranscriber:
     """Load the Whisper or SenseVoice checkpoint in ``model_dir``.
 
-    ``options`` (device, dtype, max_batch_size, batch_wait_ms) apply to both;
-    ``cuda_graphs``, ``compile_encoder`` and ``condition_on_previous_text`` to
-    Whisper only. Options left as ``None`` take the model's default.
+    ``options`` (device, dtype, max_batch_size, batch_wait_ms) and
+    ``compile_encoder`` apply to both; ``cuda_graphs`` and
+    ``condition_on_previous_text`` to Whisper only. Options left as ``None`` take
+    the model's default.
     """
     options = {name: value for name, value in options.items() if value is not None}
     if is_sensevoice(model_dir):
-        if cuda_graphs or compile_encoder or condition_on_previous_text is not None:
+        if cuda_graphs or condition_on_previous_text is not None:
             raise ValueError(
-                "--cuda-graphs, --compile-encoder and --condition-on-previous-text "
-                "apply to Whisper models only"
+                "--cuda-graphs and --condition-on-previous-text apply to Whisper "
+                "models only"
             )
-        return SenseVoiceTranscriber(model_dir, **options)
+        return SenseVoiceTranscriber(
+            model_dir, compile_encoder=compile_encoder, **options
+        )
     if condition_on_previous_text is not None:
         options["condition_on_previous_text"] = condition_on_previous_text
     return Transcriber(

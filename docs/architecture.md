@@ -66,8 +66,8 @@ flowchart TD
    model's own default (16 for Whisper, 32 for SenseVoice).
 2. **Model selection** (`models.load_transcriber`): options left as `None` are dropped. If the
    `model` value in `config.yaml` starts with `SenseVoice`, the directory is a SenseVoice checkpoint;
-   otherwise it is treated as Whisper. Passing `--cuda-graphs` or `--compile-encoder` with SenseVoice
-   raises `ValueError`, which the CLI turns into an exit with the message (`SystemExit`).
+   otherwise it is treated as Whisper. Passing `--cuda-graphs` or `--condition-on-previous-text` with
+   SenseVoice raises `ValueError`, which the CLI turns into an exit with the message (`SystemExit`).
 3. **Transcriber construction**: the weights are loaded and moved to the device and dtype, the
    model-specific preparation below runs, and **one decoding worker thread is started.** Only that
    thread touches the model.
@@ -77,7 +77,9 @@ flowchart TD
      (batch bucket × KV length bucket) pair. With `--compile-encoder`, the encoder is compiled for every
      batch bucket up front.
    - SenseVoice: `config.yaml`, the BPE model and `am.mvn` (CMVN statistics) are read, and `model.pt`
-     is loaded with `torch.load(weights_only=True)`.
+     is loaded with `torch.load(weights_only=True)`. With `--compile-encoder`, each encoder layer is
+     compiled with `torch.compile(dynamic=True)`, so the identical layers share a graph and batches
+     keep their own shapes; a warm-up compiles a batch of one and batches with and without a mask.
 4. **App creation and run** (`server.create_app`, `uvicorn.run`): when the app starts (lifespan), the
    AnyIO default thread limit (40) is raised to at least `8 × max_batch_size`. Section
    [4](#4-concurrency-model) explains why.
@@ -410,7 +412,7 @@ the results.
 | `max_batch_size` | 16 | 32 |
 | `batch_wait_ms` | 5 | 5 |
 | CUDA graphs | on with CUDA (decoder steps) | none |
-| `--compile-encoder` | off (optional) | not supported |
+| `--compile-encoder` | off (optional; batch buckets) | off (optional; per layer, dynamic shapes) |
 | Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once |
 | Decoding | greedy or temperature sampling | greedy CTC |
 | Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 |

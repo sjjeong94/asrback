@@ -42,7 +42,7 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 | `--max-batch-size` | `16` (SenseVoice: `32`) | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
 | `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper: replay each decoder step from a captured CUDA graph |
-| `--compile-encoder` | off | Whisper: `torch.compile` the encoder; slower startup, faster for larger models |
+| `--compile-encoder` | off | `torch.compile` the encoder; slower startup, faster for larger models |
 | `--condition-on-previous-text` / `--no-condition-on-previous-text` | on | Whisper: condition each 30 s window on the text before it; turned off, the windows of a long file are decoded together |
 
 Any OpenAI client works against the server:

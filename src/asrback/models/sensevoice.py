@@ -251,7 +251,8 @@ class SenseVoiceTranscriber:
     and windows from concurrent calls are decoded in batches. Decoding is greedy
     CTC, so ``prompt`` and ``temperature`` have no effect, and translation is not
     supported. ``use_itn`` asks the model for punctuation and inverse text
-    normalization ("withitn").
+    normalization ("withitn"). ``compile_encoder`` compiles the encoder layers
+    with ``torch.compile`` (dynamic shapes) at startup.
     """
 
     cuda_graphs = False
@@ -264,6 +265,7 @@ class SenseVoiceTranscriber:
         max_batch_size: int = 32,
         batch_wait_ms: float = 5.0,
         use_itn: bool = True,
+        compile_encoder: bool = False,
     ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
@@ -321,6 +323,10 @@ class SenseVoiceTranscriber:
             for index in range(self.tokenizer.get_piece_size())
             if self.tokenizer.id_to_piece(index).startswith("<|")
         }
+
+        self.compile_encoder = compile_encoder
+        if compile_encoder:
+            self._compile_encoder()
 
         self._queue: queue.SimpleQueue[_Job] = queue.SimpleQueue()
         threading.Thread(
@@ -418,6 +424,32 @@ class SenseVoiceTranscriber:
                 continue
             for job, result in zip(jobs, results):
                 job.future.set_result(result)
+
+    @torch.inference_mode()
+    def _compile_encoder(self) -> None:
+        # Each layer is compiled on its own, so the identical layers share one graph
+        # and compiling takes seconds. Batches are not padded to fixed shapes, hence
+        # dynamic shapes.
+        encoder = self.model.encoder
+        for layer in (*encoder.encoders0, *encoder.encoders, *encoder.tp_encoders):
+            layer.compile(dynamic=True)
+        # Compile now rather than on the first requests: a batch of one (size-1
+        # dimensions are specialized), and larger ones with and without a mask.
+        frontend = self.config["frontend_conf"]
+        width = frontend["n_mels"] * frontend["lfr_m"]
+        for lengths, masked in (([100], False), ([100, 100], False), ([100, 90], True)):
+            features = torch.zeros(
+                (len(lengths), max(lengths), width),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            queries = torch.zeros((len(lengths), QUERY_COUNT), dtype=torch.long)
+            self._forward(
+                features,
+                queries.to(self.device),
+                torch.tensor(lengths, device=self.device),
+                masked,
+            )
 
     def _forward(
         self, features: Tensor, queries: Tensor, lengths: Tensor, masked: bool
