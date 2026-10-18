@@ -1,5 +1,5 @@
-"""``asrback`` command: serve a Whisper or SenseVoice checkpoint over the OpenAI
-audio API."""
+"""``asrback`` command: serve a Whisper, SenseVoice or Qwen3-ASR checkpoint over the
+OpenAI audio API."""
 
 from __future__ import annotations
 
@@ -10,15 +10,16 @@ from pathlib import Path
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="asrback",
-        description="Serve a Whisper or SenseVoice model through OpenAI-compatible "
-        "/v1/audio endpoints.",
+        description="Serve a Whisper, SenseVoice or Qwen3-ASR model through "
+        "OpenAI-compatible /v1/audio endpoints.",
     )
     parser.add_argument(
         "--model-dir",
         type=Path,
         default=Path("models/whisper-tiny"),
-        help="Whisper directory (model.safetensors and tokenizer/config JSON files) "
-        "or SenseVoice directory (model.pt, config.yaml, am.mvn, BPE model).",
+        help="Whisper directory (model.safetensors and tokenizer/config JSON files), "
+        "SenseVoice directory (model.pt, config.yaml, am.mvn, BPE model) or "
+        "Qwen3-ASR directory (safetensors, config JSON files, vocab.json, merges.txt).",
     )
     parser.add_argument(
         "--model-name",
@@ -41,7 +42,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Most concurrent requests decoded together. "
-        "Default: 16 for Whisper, 32 for SenseVoice",
+        "Default: 16 for Whisper, 32 for SenseVoice and Qwen3-ASR",
     )
     parser.add_argument(
         "--batch-wait-ms",
@@ -53,12 +54,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cuda-graphs",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Replay decoder steps from captured CUDA graphs. Default: on for CUDA",
+        help="Replay decoder steps from captured CUDA graphs (Whisper, Qwen3-ASR). "
+        "Default: on for CUDA",
     )
     parser.add_argument(
         "--compile-encoder",
         action="store_true",
-        help="Compile the encoder with torch.compile (slower startup).",
+        help="Compile the encoder with torch.compile (slower startup; Whisper, "
+        "SenseVoice).",
     )
     parser.add_argument(
         "--condition-on-previous-text",

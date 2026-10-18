@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from . import __version__
 from .model_process import ProcessTranscriber
-from .models import SenseVoiceTranscriber, Transcriber
+from .models import Qwen3ASRTranscriber, SenseVoiceTranscriber, Transcriber
 from .transcription import Transcription
 
 RESPONSE_FORMATS = ("json", "text", "srt", "verbose_json", "vtt")
@@ -89,7 +89,9 @@ def render(result: Transcription, response_format: str) -> Response:
 
 
 def create_app(
-    transcriber: Transcriber | SenseVoiceTranscriber | ProcessTranscriber,
+    transcriber: (
+        Transcriber | SenseVoiceTranscriber | Qwen3ASRTranscriber | ProcessTranscriber
+    ),
     model_name: str,
 ) -> FastAPI:
     """Build the app. Requests may name any model; ``model_name`` is what we list."""

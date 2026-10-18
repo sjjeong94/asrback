@@ -19,7 +19,6 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import asrfront
 import numpy as np
@@ -32,6 +31,7 @@ from torch import Tensor, nn
 from ..transcription import (
     DTYPES,
     AudioSource,
+    CapturedGraph,
     Segment,
     Transcription,
     compression_ratio,
@@ -424,26 +424,6 @@ class _DecodeState:
         self.tokens[rows] = 0
 
 
-class _Graph:
-    """A function of fixed-address tensors captured once as a CUDA graph."""
-
-    def __init__(self, function: Callable[[], None]) -> None:
-        # Warm up on a side stream so lazy initialization stays out of the graph.
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                function()
-        torch.cuda.current_stream().wait_stream(stream)
-
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
-            function()
-
-    def replay(self) -> None:
-        self.graph.replay()
-
-
 class Transcriber:
     """Loads a Whisper checkpoint once and transcribes or translates audio.
 
@@ -567,7 +547,7 @@ class Transcriber:
             max_batch_size, self.config["max_target_positions"], self.device
         )
         self._rows: dict[int, _Row] = {}
-        self._graphs: dict[tuple[int, int], _Graph] = {}
+        self._graphs: dict[tuple[int, int], CapturedGraph] = {}
         if self.cuda_graphs:
             self._capture_graphs()
 
@@ -712,7 +692,7 @@ class Transcriber:
                 state.finished.zero_()
                 state.position.zero_()
                 state.end.fill_(self.config["max_target_positions"] - 1)
-                self._graphs[batch_size, length] = _Graph(
+                self._graphs[batch_size, length] = CapturedGraph(
                     lambda state=state, cache=cache: self._step(state, cache)
                 )
         self._state.free(torch.arange(self.max_batch_size, device=self.device))

@@ -1,4 +1,4 @@
-"""Types and helpers shared by the Whisper and SenseVoice transcribers."""
+"""Types and helpers shared by the transcribers."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import queue
 import time
 import zlib
 from dataclasses import dataclass, field
-from typing import Union
+from typing import Callable, Union
 
 import numpy as np
 import torch
@@ -62,3 +62,27 @@ def gather_batch(jobs: queue.SimpleQueue, max_size: int, wait: float) -> list:
         except queue.Empty:
             break
     return batch
+
+
+class CapturedGraph:
+    """A function of fixed-address tensors captured once as a CUDA graph.
+
+    Graphs that never replay concurrently can share their memory ``pool``
+    (``torch.cuda.graph_pool_handle()``).
+    """
+
+    def __init__(self, function: Callable[[], None], pool=None) -> None:
+        # Warm up on a side stream so lazy initialization stays out of the graph.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                function()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=pool, capture_error_mode="thread_local"):
+            function()
+
+    def replay(self) -> None:
+        self.graph.replay()

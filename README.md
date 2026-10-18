@@ -1,8 +1,8 @@
 # asrback
 
 OpenAI-compatible speech-to-text server for Whisper checkpoints in Hugging Face
-SafeTensors format and for FunASR's SenseVoiceSmall, implemented in plain PyTorch (no
-`transformers`, `openai-whisper` or `funasr` at runtime).
+SafeTensors format, FunASR's SenseVoiceSmall and Qwen3-ASR (0.6B, 1.7B), implemented in
+plain PyTorch (no `transformers`, `openai-whisper`, `funasr` or `qwen-asr` at runtime).
 
 ## Setup
 
@@ -10,6 +10,7 @@ SafeTensors format and for FunASR's SenseVoiceSmall, implemented in plain PyTorc
 uv sync
 scripts/download_whisper_hf.sh tiny   # -> models/whisper-tiny (tiny, base, small, *.en, large-v3-turbo)
 scripts/download_sensevoice_hf.sh     # -> models/sensevoice-small
+scripts/download_qwen3_asr_hf.sh      # -> models/qwen3-asr-{0.6b,1.7b} (or pass 0.6B / 1.7B)
 ```
 
 ## Server
@@ -17,12 +18,20 @@ scripts/download_sensevoice_hf.sh     # -> models/sensevoice-small
 ```bash
 uv run asrback --model-dir models/whisper-tiny --port 8000
 uv run asrback --model-dir models/sensevoice-small --port 8000
+uv run asrback --model-dir models/qwen3-asr-0.6b --port 8000
 ```
 
 The model type is detected from the directory. SenseVoice transcribes Chinese,
 English, Cantonese, Japanese and Korean (`zh`, `en`, `yue`, `ja`, `ko`) with greedy
 CTC decoding: it does not translate, and `prompt` and `temperature` have no effect.
 Its output includes punctuation and inverse text normalization.
+
+Qwen3-ASR transcribes 30 languages (`zh`, `en`, `yue`, `ar`, `de`, `fr`, `es`, `pt`,
+`id`, `it`, `ko`, `ru`, `th`, `vi`, `ja`, `tr`, `hi`, `ms`, `nl`, `sv`, `da`, `fi`,
+`pl`, `cs`, `fil`, `fa`, `el`, `ro`, `hu`, `mk`) with punctuation. Without `language`
+it names the language it hears in each window; with one, the prompt names it. `prompt`
+becomes the system message, so it can carry context such as names and terms. It does
+not translate. Windows of a long file are decoded independently and together.
 
 Endpoints:
 
@@ -39,11 +48,11 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 | Option | Default | |
 | --- | --- | --- |
 | `--dtype` | `bfloat16` on CUDA, else `float32` | Model precision (`float32`, `bfloat16`) |
-| `--max-batch-size` | `16` (SenseVoice: `32`) | Most requests decoded together |
+| `--max-batch-size` | `16` (SenseVoice, Qwen3-ASR: `32`) | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
-| `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper: replay each decoder step from a captured CUDA graph |
+| `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper, Qwen3-ASR: replay each decoder step from a captured CUDA graph |
 | `--model-process` / `--no-model-process` | on | Run the model in a child process so HTTP handling does not hold up decoding |
-| `--compile-encoder` | off | `torch.compile` the encoder; slower startup, faster for larger models |
+| `--compile-encoder` | off | Whisper, SenseVoice: `torch.compile` the encoder; slower startup, faster for larger models |
 | `--condition-on-previous-text` / `--no-condition-on-previous-text` | on | Whisper: condition each 30 s window on the text before it; turned off, the windows of a long file are decoded together |
 
 Any OpenAI client works against the server:
@@ -114,6 +123,11 @@ Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 | whisper-small.en | 3.03% | 3.03% | 52.3 s | 134.7 s |
 | whisper-large-v3-turbo | 2.07% | 2.10% | 160.1 s | 401.1 s |
 | sensevoice-small | 3.44% | 3.45% | 11.9 s | 18.0 s |
+| qwen3-asr-0.6b | 2.12% | 2.13% | 56.7 s | 166.5 s |
+| qwen3-asr-1.7b | 1.64% | 1.66%¹ | 78.5 s | 246.8 s¹ |
+
+¹ `--max-batch-size 16`: in float32 the 1.7B weights and the KV cache of 32 rows do not
+fit in 16 GB.
 
 `--compile-encoder` brings whisper-small to 49.3 s (small.en 50.2 s) at the cost of
 about 20 s more startup; it does not help tiny or base.
@@ -130,6 +144,8 @@ FLEURS test, greedy decoding, bfloat16:
 | whisper-small.en | 7.77% | | |
 | whisper-large-v3-turbo | 6.13% | 3.35% | 6.07% |
 | sensevoice-small | 9.06% | 6.61% | 7.56% |
+| qwen3-asr-0.6b | 5.75% | 3.97% | 8.49% |
+| qwen3-asr-1.7b | 4.71% | 2.62% | 5.41% |
 
 Smaller models sometimes repeat a phrase until the token limit, especially in
 Japanese; without temperature fallback (see below) these loops dominate their error
@@ -141,11 +157,12 @@ rates.
   on repetitive output.
 - No word-level timestamps; segments are fixed 30-second windows.
 - One model per server process.
-- English-only (`*.en`) and SenseVoice models support transcription only, not
-  translation.
+- English-only (`*.en`), SenseVoice and Qwen3-ASR models support transcription only,
+  not translation.
 
 ## License
 
 The code is released under the [MIT License](LICENSE). Model weights are not part of
-this repository and keep their own licenses: Whisper (MIT) and SenseVoiceSmall (see its
-[model card](https://huggingface.co/FunAudioLLM/SenseVoiceSmall)).
+this repository and keep their own licenses: Whisper (MIT), SenseVoiceSmall (see its
+[model card](https://huggingface.co/FunAudioLLM/SenseVoiceSmall)) and Qwen3-ASR
+(Apache 2.0).

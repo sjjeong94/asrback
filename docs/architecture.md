@@ -10,26 +10,28 @@ interactive client (`asrback-client`).
 - [4. Concurrency model](#4-concurrency-model)
 - [5. Whisper inference](#5-whisper-inference)
 - [6. SenseVoice inference](#6-sensevoice-inference)
-- [7. Responses](#7-responses)
-- [8. Evaluation tool (asrback-eval)](#8-evaluation-tool-asrback-eval)
-- [9. Interactive client (asrback-client)](#9-interactive-client-asrback-client)
-- [10. Error handling](#10-error-handling)
-- [11. Defaults](#11-defaults)
+- [7. Qwen3-ASR inference](#7-qwen3-asr-inference)
+- [8. Responses](#8-responses)
+- [9. Evaluation tool (asrback-eval)](#9-evaluation-tool-asrback-eval)
+- [10. Interactive client (asrback-client)](#10-interactive-client-asrback-client)
+- [11. Error handling](#11-error-handling)
+- [12. Defaults](#12-defaults)
 
 ## 1. Package layout
 
 ```
 src/asrback/
-├── __init__.py          # Public API: Transcriber, SenseVoiceTranscriber, load_transcriber, ...
+├── __init__.py          # Public API: Transcriber, SenseVoiceTranscriber, Qwen3ASRTranscriber, ...
 ├── __main__.py          # python -m asrback → cli.main
 ├── cli.py               # asrback: parse arguments, load the model, run uvicorn
 ├── server.py            # FastAPI app: /v1/audio/*, /v1/models, /health
 ├── model_process.py     # ProcessTranscriber: the transcriber in a child process (--model-process)
-├── transcription.py     # Shared types and helpers: Segment, Transcription, gather_batch, ...
+├── transcription.py     # Shared types and helpers: Segment, Transcription, gather_batch, CapturedGraph, ...
 ├── models/
-│   ├── __init__.py      # load_transcriber: pick Whisper or SenseVoice from the model directory
+│   ├── __init__.py      # load_transcriber: pick Whisper, SenseVoice or Qwen3-ASR from the model directory
 │   ├── whisper.py       # Whisper network + Transcriber (batched decoding, CUDA graphs)
-│   └── sensevoice.py    # SenseVoiceSmall network + SenseVoiceTranscriber (CTC)
+│   ├── sensevoice.py    # SenseVoiceSmall network + SenseVoiceTranscriber (CTC)
+│   └── qwen3_asr.py     # Qwen3-ASR network + Qwen3ASRTranscriber (batched decoding, CUDA graphs)
 ├── evaluation.py        # asrback-eval: WER / CER on LibriSpeech or FLEURS
 └── client.py            # asrback-client: interactive transcription client
 scripts/                 # Model and dataset download scripts
@@ -39,9 +41,9 @@ What each external dependency is used for:
 
 | Dependency | Used by | Purpose |
 | --- | --- | --- |
-| `asrfront` | both models | Audio decoding (`asrfront.load`), Whisper log-mel, SenseVoice fbank + LFR + CMVN |
-| `torch` | both models | Network computation, CUDA graphs |
-| `safetensors`, `tokenizers` | Whisper | Weights (`model.safetensors`) and tokenizer (`tokenizer.json`) |
+| `asrfront` | all models | Audio decoding (`asrfront.load`), Whisper log-mel, SenseVoice fbank + LFR + CMVN, Qwen3-ASR log-mel and audio token counts |
+| `torch` | all models | Network computation, CUDA graphs, flash attention for packed sequences (`varlen_attn`) |
+| `safetensors`, `tokenizers` | Whisper, Qwen3-ASR | Weights (`model.safetensors`, or shards) and tokenizer (`tokenizer.json`; for Qwen3-ASR, byte-level BPE built from `vocab.json` and `merges.txt`) |
 | `sentencepiece`, `pyyaml` | SenseVoice | BPE tokenizer, `config.yaml` |
 | `fastapi`, `uvicorn[standard]`, `python-multipart` | server | HTTP and multipart upload parsing (with uvloop and httptools) |
 | `openai` | eval, client | Calls to the OpenAI-compatible API |
@@ -60,15 +62,18 @@ flowchart TD
     P -- no --> D["models.load_transcriber(DIR, ...)"]
     D --> E{"is_sensevoice(DIR)?<br/>model in config.yaml starts with SenseVoice"}
     E -- yes --> F["SenseVoiceTranscriber(...)"]
-    E -- no --> G["Transcriber(...) (Whisper)"]
+    E -- no --> Q{"is_qwen3_asr(DIR)?<br/>model_type in config.json is qwen3_asr"}
+    Q -- yes --> QT["Qwen3ASRTranscriber(...)"]
+    Q -- no --> G["Transcriber(...) (Whisper)"]
     F --> H["create_app(transcriber, model_name)"]
+    QT --> H
     G --> H
     H --> I["uvicorn.run(app)"]
     I --> J["lifespan: raise the AnyIO thread limit<br/>to max(40, 8 × max_batch_size)"]
 ```
 
 1. **Argument parsing** (`cli.parse_args`): `--max-batch-size` defaults to `None`, which means the
-   model's own default (16 for Whisper, 32 for SenseVoice).
+   model's own default (16 for Whisper, 32 for SenseVoice and Qwen3-ASR).
 2. **Model process** (`model_process.ProcessTranscriber`, on by default): the steps below run in a
    child process started with `spawn`. The server process keeps only a proxy with the same interface
    (`transcribe`, `languages`, `max_batch_size`, ...); errors while loading are sent back and raised
@@ -76,8 +81,10 @@ flowchart TD
    in the server process.
 3. **Model selection** (`models.load_transcriber`): options left as `None` are dropped. If the
    `model` value in `config.yaml` starts with `SenseVoice`, the directory is a SenseVoice checkpoint;
-   otherwise it is treated as Whisper. Passing `--cuda-graphs` or `--condition-on-previous-text` with
-   SenseVoice raises `ValueError`, which the CLI turns into an exit with the message (`SystemExit`).
+   if `model_type` in `config.json` is `qwen3_asr`, a Qwen3-ASR checkpoint; otherwise it is treated as
+   Whisper. Passing `--cuda-graphs` or `--condition-on-previous-text` with SenseVoice, or
+   `--compile-encoder` or `--condition-on-previous-text` with Qwen3-ASR, raises `ValueError`, which the
+   CLI turns into an exit with the message (`SystemExit`).
 4. **Transcriber construction**: the weights are loaded and moved to the device and dtype, the
    model-specific preparation below runs, and **one decoding worker thread is started.** Only that
    thread touches the model.
@@ -90,6 +97,12 @@ flowchart TD
      is loaded with `torch.load(weights_only=True)`. With `--compile-encoder`, each encoder layer is
      compiled with `torch.compile(dynamic=True)`, so the identical layers share a graph and batches
      keep their own shapes; a warm-up compiles a batch of one and batches with and without a mask.
+   - Qwen3-ASR: the model is built on the `meta` device and takes the SafeTensors tensors (one file or
+     the shards of `model.safetensors.index.json`) in place of its parameters, so no memory is spent
+     on random initialization. The tokenizer is assembled from `vocab.json`, `merges.txt` and the added
+     tokens of `tokenizer_config.json`; the chat-template pieces, the RoPE tables, the KV cache and the
+     state buffers are built once, and with CUDA graphs on one decoder step is captured for every
+     (batch bucket × KV length bucket) pair, sharing one memory pool.
 5. **App creation and run** (`server.create_app`, `uvicorn.run`): when the app starts (lifespan), the
    AnyIO default thread limit (40) is raised to at least `8 × max_batch_size`. Section
    [4](#4-concurrency-model) explains why.
@@ -121,7 +134,7 @@ Endpoints (`server.py`):
 | Endpoint | Handling |
 | --- | --- |
 | `POST /v1/audio/transcriptions` | 400 if `timestamp_granularities[]` contains `word`, or if `language` is not supported. Then `run(..., task="transcribe")` |
-| `POST /v1/audio/translations` | `run(..., task="translate")`. Models that cannot translate (`*.en`, SenseVoice) raise `ValueError` in `transcribe()`, which becomes a 400 |
+| `POST /v1/audio/translations` | `run(..., task="translate")`. Models that cannot translate (`*.en`, SenseVoice, Qwen3-ASR) raise `ValueError` in `transcribe()`, which becomes a 400 |
 | `GET /v1/models`, `GET /v1/models/{id}` | Lists the single loaded model (id from `--model-name` or the directory name). The request's `model` field is ignored |
 | `GET /health` | `{"status": "ok"}`, or 503 when the model process has exited (`--model-process`) |
 
@@ -132,7 +145,7 @@ The shared handler `run()`:
 2. Reads the whole upload into bytes. An empty file is a 400.
 3. Calls `transcriber.transcribe(audio_bytes, temperature=..., language=..., task=..., prompt=...)`,
    which blocks the request thread until the result is ready.
-4. Formats the result with `render()` (section [7](#7-responses)).
+4. Formats the result with `render()` (section [8](#8-responses)).
 
 The endpoints are plain `def`, not `async def`, so the event loop stays responsive while a request
 waits for inference: FastAPI runs sync endpoints in the AnyIO thread pool.
@@ -395,7 +408,94 @@ flowchart TD
 - **dtype**: activations reach about 71,000 in the last layers, beyond the float16 maximum (65,504), so
   the CUDA default is bfloat16.
 
-## 7. Responses
+## 7. Qwen3-ASR inference
+
+Implementation: `models/qwen3_asr.py`, a plain PyTorch reimplementation of the Qwen3-ASR checkpoints
+(0.6B and 1.7B: an audio encoder and a Qwen3 language model). The decoding worker follows Whisper's
+continuous batching (section [5.2](#52-worker-continuous-batching)).
+
+### 7.1 Request thread: `Qwen3ASRTranscriber.transcribe`
+
+```mermaid
+flowchart TD
+    A["Audio"] --> B["asrfront.load → float32 waveform"]
+    B --> C["Split into 30 s windows<br/>drop a trailing window under 0.1 s, zero-pad windows under 0.5 s"]
+    C --> D["asrfront.qwen3_asr.log_mel per window<br/>(128, samples // 160), no padding to 30 s"]
+    D --> E["Queue the _Job of every window at once<br/>(features, prompt tokens, language, temperature)"]
+    E --> F["Wait on all futures"]
+    F --> G["Build segments, join window texts with spaces;<br/>language = the given one, else the first detected"]
+```
+
+- **Windows** are independent, as for SenseVoice, so the windows of a long recording share batches.
+- **`prompt`** is tokenized once and becomes the system message of every window (its last 224 tokens).
+- **`language`** (ISO code, mapped to the model's name such as `Korean`) is optional; translation is not
+  supported.
+
+### 7.2 The prompt and the output
+
+Qwen3-ASR's chat template, with `N = asrfront.qwen3_asr.num_audio_tokens(frames)` audio placeholders
+(13 per 100 frames, about 13 per second):
+
+```
+<|im_start|>system\n{prompt}<|im_end|>\n
+<|im_start|>user\n<|audio_start|><|audio_pad|> × N<|audio_end|><|im_end|>\n
+<|im_start|>assistant\n[language Korean<asr_text>]
+```
+
+The model writes `language <Name><asr_text><transcript>` and stops at `<|im_end|>` or `<|endoftext|>`.
+With a request language, `language <Name><asr_text>` is already part of the prompt and the model writes
+only the transcript. `_parse` takes the language from the tokens before `<asr_text>` (`language None`,
+the model's answer for audio without speech, sets `no_speech_prob` to 1); the text is the rest, decoded,
+with repeated characters or short patterns (more than 20 times in a row) collapsed as qwen-asr does.
+`avg_logprob` counts every generated token, including the language prefix and the end token.
+
+### 7.3 Worker: admitting windows
+
+```mermaid
+flowchart TD
+    A["New windows, up to the free rows"] --> B["Audio encoder over every window's 100-frame chunks<br/>→ packed (audio tokens, hidden)"]
+    B --> C["Prompts laid out back to back: token embeddings,<br/>audio embeddings in place of <|audio_pad|>"]
+    C --> D["Prefill: causal attention within each prompt (varlen flash attention);<br/>every token's K/V written to its row and position of the cache"]
+    D --> E["lm_head at each prompt's last token → first token (greedy or sampled)"]
+    E --> F["Set each row's token, position, end and log-probability"]
+```
+
+- **Packing**: prompts differ in length (the audio part grows with the window), so they are not padded:
+  linear layers run on all tokens at once and `varlen_attn` keeps each prompt's attention to itself.
+  On CPU or with float32, the same call becomes one padded `scaled_dot_product_attention` with a mask.
+- **The KV cache** (`KVCache`) is two preallocated tensors shaped
+  `(layers, max_batch_size, 1024, kv_heads, head_dim)`. A row's prompt and generated tokens share its
+  1024 positions; `limit = min(max_new_tokens or 512, 1024 - prompt_length)`.
+
+### 7.4 Worker: decoder steps
+
+As in Whisper (section [5.3](#53-worker-admitting-windows-and-decoder-steps)): `_advance` runs up to 4
+steps over the smallest batch bucket that covers the occupied rows and the shortest KV length bucket
+(128, 256, 512, 768, 1024) that covers their next steps, from a CUDA graph when every occupied row is
+greedy; `_finish` transfers the finished flags once and returns the finished rows' results.
+
+One step decodes each row's token at its own position: the key and value go to that position of the
+row, and the query attends to positions up to it through a `(batch, 1, 1, length)` mask. The query heads
+that share a key/value head (grouped-query attention, 16 query and 8 key/value heads) are passed to
+`scaled_dot_product_attention` as one group of queries for that head, so no keys are repeated.
+
+### 7.5 Network
+
+| Part | Details |
+| --- | --- |
+| Input | Whisper-style log-mel `(128, frames)`, 100 frames per second |
+| Audio encoder | per 100-frame chunk (the last zero-padded): 3 × (Conv2d k=3 stride 2 → GELU) → linear → sinusoidal positions restarting in every chunk → 13 tokens; Transformer layers (18 for 0.6B, 24 for 1.7B) attending within windows of 8 chunks (8 s, 104 tokens) → LayerNorm → linear → GELU → linear to the LLM width |
+| Language model | Qwen3: RMSNorm, attention with per-head RMSNorm on queries and keys, RoPE (θ = 10⁶; the multimodal RoPE reduces to it for text positions), SwiGLU MLP; 28 layers |
+| Output | `lm_head` (not tied to the embeddings in these checkpoints) |
+| Weights | names match the Hugging Face checkpoint (`thinker.audio_tower...`, `thinker.model...`, `thinker.lm_head`) |
+
+The encoder attends within 8-second windows (`n_window_infer`), as qwen-asr's vLLM backend and its
+transformers backend with flash attention do. Its transformers backend with SDPA ignores those windows
+and attends over the whole input; on FLEURS with 0.6B the two give the same error rates (ko 3.97% vs
+3.91%, ja 8.49% vs 8.56% CER). In float32, the transcripts match the transformers backend with the
+window mask exactly on a sample of LibriSpeech and FLEURS files.
+
+## 8. Responses
 
 `server.render()` turns a `Transcription` into the requested format:
 
@@ -408,7 +508,7 @@ flowchart TD
 
 Segments are 30-second windows; there are no word-level timestamps.
 
-## 8. Evaluation tool (asrback-eval)
+## 9. Evaluation tool (asrback-eval)
 
 Implementation: `evaluation.py`. It sends requests to a running server through the OpenAI client from
 several client processes and measures error rates in the main process.
@@ -446,7 +546,7 @@ flowchart TD
 - **Concurrency**: keep `--concurrency` well above the server's `max_batch_size` so batches fill and
   SenseVoice can group windows of similar length.
 
-## 9. Interactive client (asrback-client)
+## 10. Interactive client (asrback-client)
 
 Implementation: `client.py`. It reads audio file paths at a prompt, sends them to the server and prints
 the results.
@@ -458,7 +558,7 @@ the results.
 4. Prints the status code and message on API errors, or a hint on connection failures, then waits for
    the next path.
 
-## 10. Error handling
+## 11. Error handling
 
 | Situation | Handling |
 | --- | --- |
@@ -467,21 +567,21 @@ the results.
 | Unsupported language, format or temperature; empty file; word timestamps requested | `APIError` → 400 |
 | Task the model cannot do (translation) | `ValueError` from `transcribe()` → 400 |
 | Unknown model id | 404 |
-| Exception during batched inference | The same exception reaches every request of that batch (Whisper: of every occupied row) and FastAPI answers 500; the worker keeps running |
+| Exception during batched inference | The same exception reaches every request of that batch (Whisper, Qwen3-ASR: of every occupied row) and FastAPI answers 500; the worker keeps running |
 | Model process exited (`--model-process`) | Pending and later requests raise `RuntimeError` (500) |
 
-## 11. Defaults
+## 12. Defaults
 
-| Item | Whisper | SenseVoice |
-| --- | --- | --- |
-| dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) |
-| `max_batch_size` | 16 | 32 |
-| `batch_wait_ms` | 5 | 5 |
-| Model process | on (`--no-model-process` to load in the server process) | on |
-| CUDA graphs | on with CUDA (decoder steps) | none |
-| `--compile-encoder` | off (optional; batch buckets) | off (optional; per layer, dynamic shapes) |
-| Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once |
-| Batching | continuous: rows join and leave a pool of `max_batch_size` every 4 steps | batches of similar length |
-| Decoding | greedy or temperature sampling | greedy CTC |
-| Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 |
-| Eval concurrency | 128 requests from 4 processes | 128 requests from 4 processes |
+| Item | Whisper | SenseVoice | Qwen3-ASR |
+| --- | --- | --- | --- |
+| dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) |
+| `max_batch_size` | 16 | 32 | 32 |
+| `batch_wait_ms` | 5 | 5 | 5 |
+| Model process | on (`--no-model-process` to load in the server process) | on | on |
+| CUDA graphs | on with CUDA (decoder steps) | none | on with CUDA (decoder steps) |
+| `--compile-encoder` | off (optional; batch buckets) | off (optional; per layer, dynamic shapes) | not supported |
+| Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once | 30 s windows all at once |
+| Batching | continuous: rows join and leave a pool of `max_batch_size` every 4 steps | batches of similar length | continuous, as for Whisper; prompts prefilled packed |
+| Decoding | greedy or temperature sampling | greedy CTC | greedy or temperature sampling, at most 512 new tokens |
+| Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 | max(40, 8 × 32) = 256 |
+| Eval concurrency | 128 requests from 4 processes | 128 requests from 4 processes | 128 requests from 4 processes |

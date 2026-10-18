@@ -1,13 +1,13 @@
 [project]
 name = "asrback"
 dynamic = ["version"]
-description = "OpenAI-compatible speech-to-text server for Whisper and SenseVoice checkpoints"
+description = "OpenAI-compatible speech-to-text server for Whisper, SenseVoice and Qwen3-ASR checkpoints"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
-    "asrfront>=0.2.0",
+    "asrfront>=0.2.1",
     "fastapi",
     "numpy",
     "openai",
