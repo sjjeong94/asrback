@@ -68,6 +68,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-condition-on-previous-text, the windows of a long file are decoded "
         "together. Default: on",
     )
+    parser.add_argument(
+        "--model-process",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the model in a child process, so that HTTP handling does not hold "
+        "up decoding. Default: on",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=8000, help="Default: 8000")
     args = parser.parse_args(argv)
@@ -84,13 +91,15 @@ def main(argv: list[str] | None = None) -> int:
     import torch
     import uvicorn
 
+    from .model_process import ProcessTranscriber
     from .models import load_transcriber
     from .server import create_app
 
     # TF32 matmuls on Ampere+ GPUs; no effect on CPU or half precision.
     torch.set_float32_matmul_precision("high")
+    load = ProcessTranscriber if args.model_process else load_transcriber
     try:
-        transcriber = load_transcriber(
+        transcriber = load(
             args.model_dir,
             device=args.device,
             dtype=args.dtype,

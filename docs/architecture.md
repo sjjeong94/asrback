@@ -24,6 +24,7 @@ src/asrback/
 ├── __main__.py          # python -m asrback → cli.main
 ├── cli.py               # asrback: parse arguments, load the model, run uvicorn
 ├── server.py            # FastAPI app: /v1/audio/*, /v1/models, /health
+├── model_process.py     # ProcessTranscriber: the transcriber in a child process (--model-process)
 ├── transcription.py     # Shared types and helpers: Segment, Transcription, gather_batch, ...
 ├── models/
 │   ├── __init__.py      # load_transcriber: pick Whisper or SenseVoice from the model directory
@@ -52,7 +53,11 @@ What each external dependency is used for:
 flowchart TD
     A["asrback --model-dir DIR ..."] --> B["cli.parse_args"]
     B --> C["torch.set_float32_matmul_precision('high')"]
-    C --> D["models.load_transcriber(DIR, ...)"]
+    C --> P{"--model-process?<br/>(default on)"}
+    P -- yes --> PT["ProcessTranscriber: spawn a child process<br/>that runs load_transcriber and serves requests"]
+    PT -.-> D
+    PT --> H
+    P -- no --> D["models.load_transcriber(DIR, ...)"]
     D --> E{"is_sensevoice(DIR)?<br/>model in config.yaml starts with SenseVoice"}
     E -- yes --> F["SenseVoiceTranscriber(...)"]
     E -- no --> G["Transcriber(...) (Whisper)"]
@@ -64,11 +69,16 @@ flowchart TD
 
 1. **Argument parsing** (`cli.parse_args`): `--max-batch-size` defaults to `None`, which means the
    model's own default (16 for Whisper, 32 for SenseVoice).
-2. **Model selection** (`models.load_transcriber`): options left as `None` are dropped. If the
+2. **Model process** (`model_process.ProcessTranscriber`, on by default): the steps below run in a
+   child process started with `spawn`. The server process keeps only a proxy with the same interface
+   (`transcribe`, `languages`, `max_batch_size`, ...); errors while loading are sent back and raised
+   in the server process, so the CLI handles them the same way. `--no-model-process` loads the model
+   in the server process.
+3. **Model selection** (`models.load_transcriber`): options left as `None` are dropped. If the
    `model` value in `config.yaml` starts with `SenseVoice`, the directory is a SenseVoice checkpoint;
    otherwise it is treated as Whisper. Passing `--cuda-graphs` or `--condition-on-previous-text` with
    SenseVoice raises `ValueError`, which the CLI turns into an exit with the message (`SystemExit`).
-3. **Transcriber construction**: the weights are loaded and moved to the device and dtype, the
+4. **Transcriber construction**: the weights are loaded and moved to the device and dtype, the
    model-specific preparation below runs, and **one decoding worker thread is started.** Only that
    thread touches the model.
    - Whisper: token ids (start of transcript, languages, tasks, `<|notimestamps|>`, ...) and the
@@ -80,7 +90,7 @@ flowchart TD
      is loaded with `torch.load(weights_only=True)`. With `--compile-encoder`, each encoder layer is
      compiled with `torch.compile(dynamic=True)`, so the identical layers share a graph and batches
      keep their own shapes; a warm-up compiles a batch of one and batches with and without a mask.
-4. **App creation and run** (`server.create_app`, `uvicorn.run`): when the app starts (lifespan), the
+5. **App creation and run** (`server.create_app`, `uvicorn.run`): when the app starts (lifespan), the
    AnyIO default thread limit (40) is raised to at least `8 × max_batch_size`. Section
    [4](#4-concurrency-model) explains why.
 
@@ -162,6 +172,37 @@ flowchart LR
   `8 × max_batch_size` (at least 40).
 - **Errors**: if batched inference raises, the same exception goes into every `Future` of that batch.
   The worker keeps running.
+
+### 4.1 Model process (`--model-process`, default)
+
+With the model in the server process, the uvicorn event loop (HTTP parsing and `python-multipart`,
+both pure Python) holds the GIL most of the time, and the worker thread waits for it before
+launching each batch's kernels. On LibriSpeech test-clean with SenseVoice, the GPU was then busy only
+about 60% of the time.
+
+`ProcessTranscriber` moves everything above into a child process:
+
+```mermaid
+flowchart LR
+    subgraph S["Server process"]
+        E["Event loop + request threads"] --> P["ProcessTranscriber.transcribe<br/>send (id, audio bytes, options)"]
+        RX["Result thread<br/>future.set_result"]
+    end
+    subgraph M["Model process"]
+        RQ["Request threads (8 × max_batch_size)<br/>transcriber.transcribe()"] --> W2["Worker thread<br/>batched inference"]
+    end
+    P -- "Pipe" --> RQ
+    RQ -- "(id, Transcription or exception)" --> RX
+```
+
+- Only the upload's bytes and the `Transcription` cross the pipe; audio decoding and feature extraction
+  happen in the model process, where they release the GIL.
+- Exceptions from `transcribe()` (for example the `ValueError` of an unsupported task) are sent back and
+  raised by the caller, so they become 400s as before.
+- The model process ignores SIGINT and is a daemon: it stops with the server process, and it exits when
+  the pipe closes. If it dies, pending and later requests fail with `RuntimeError` (500).
+- Measured with a lightweight multi-process client on LibriSpeech test-clean (RTX 5060 Ti): SenseVoice
+  11.1–11.5 s → 9.4–9.5 s (GPU busy 64% → 77%); whisper-small 60.8 s → 59.3 s (already GPU-bound).
 
 ## 5. Whisper inference
 
@@ -403,6 +444,7 @@ the results.
 | Task the model cannot do (translation) | `ValueError` from `transcribe()` → 400 |
 | Unknown model id | 404 |
 | Exception during batched inference | The same exception reaches every request of that batch (FastAPI answers 500); the worker keeps running |
+| Model process exited (`--model-process`) | Pending and later requests raise `RuntimeError` (500) |
 
 ## 11. Defaults
 
@@ -411,6 +453,7 @@ the results.
 | dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) |
 | `max_batch_size` | 16 | 32 |
 | `batch_wait_ms` | 5 | 5 |
+| Model process | on (`--no-model-process` to load in the server process) | on |
 | CUDA graphs | on with CUDA (decoder steps) | none |
 | `--compile-encoder` | off (optional; batch buckets) | off (optional; per layer, dynamic shapes) |
 | Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once |
