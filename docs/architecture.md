@@ -359,7 +359,7 @@ flowchart TD
     B --> C["embed(queries) followed by features → (B, 4+T, 560)"]
     C --> D["× √512 + sinusoidal positions (1..4+T)"]
     D --> E["encoders0 (560→512, no residual)<br/>→ 49 encoders → after_norm<br/>→ 20 tp_encoders → tp_norm"]
-    E --> F["ctc_lo → logits (B, 4+T, 25055)"]
+    E --> F["ctc_lo → logits (B, 4+T, 25055),<br/>a few rows (about 2048 frames) at a time"]
     F --> G["greedy_ctc: argmax and logsumexp per frame<br/>→ best token, its log-prob, P(nospeech)"]
     G --> H["Mean log-prob over speech frames per row, one transfer to the CPU"]
     H --> I["Per row: merge repeats → drop blanks (0)<br/>→ language from its tag → drop special tokens → BPE decode"]
@@ -368,8 +368,15 @@ flowchart TD
 - **Mask**: when every row has the same length, no mask is used. Otherwise a `(B, 4+T)` mask hides
   padding frames from the FSMN input and from attention keys. Batching rows of different lengths gives
   the same results as decoding them one by one.
-- **SAN-M attention**: one linear layer produces Q, K and V; the output is SDPA attention plus an FSMN
-  memory, a depthwise convolution (k=11) over V.
+- **SAN-M attention**: one linear layer produces Q, K and V; the output is attention plus an FSMN
+  memory, a depthwise convolution (k=11) over V. Without a mask, attention is
+  `F.scaled_dot_product_attention` (flash attention on CUDA). With one, SDPA would fall back to the
+  memory-efficient kernel, about 2.5× slower, so on CUDA with bfloat16 the padded batch goes to
+  `varlen_attn` (flash attention for variable-length sequences) instead: rows are laid out back to back
+  and `seqused_k` stops each row's keys at its length. `varlen_supported()` checks at startup that it
+  runs on the device; otherwise (CPU, float32) masked SDPA is used.
+  cuDNN attention is as fast with a mask but builds a plan for every new shape (about 36 ms each),
+  which costs more than it saves with LibriSpeech's varying lengths.
 - **Reading the output**: the CTC output at the first four frames carries a language tag such as
   `<|en|>` and emotion, event and ITN tags. The language tag gives the detected language, and every
   `<|...|>` special token is removed from the text.

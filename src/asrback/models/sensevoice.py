@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import yaml
 from sentencepiece import SentencePieceProcessor
 from torch import Tensor, nn
+from torch.nn.attention.varlen import varlen_attn
 
 from ..transcription import (
     DTYPES,
@@ -59,7 +60,16 @@ BLANK_ID = 0
 
 
 class SANMAttention(nn.Module):
-    """Self-attention plus a depthwise convolution (FSMN memory) over the values."""
+    """Self-attention plus a depthwise convolution (FSMN memory) over the values.
+
+    With ``varlen`` set (flash attention on CUDA, bfloat16), a padded batch runs
+    attention as variable-length sequences: each row's keys stop at its length, so
+    no mask is needed. ``scaled_dot_product_attention`` with a padding mask would
+    use the memory-efficient kernel, about 2.5x slower on these shapes; without
+    one it already uses flash attention.
+    """
+
+    varlen = False
 
     def __init__(self, in_size: int, size: int, heads: int, kernel_size: int) -> None:
         super().__init__()
@@ -77,8 +87,9 @@ class SANMAttention(nn.Module):
         batch, length, width = x.shape
         return x.view(batch, length, self.heads, width // self.heads).transpose(1, 2)
 
-    def forward(self, x: Tensor, mask: Tensor | None) -> Tensor:
-        """``mask`` is ``(batch, length)``, True for real frames (None: all real)."""
+    def forward(self, x: Tensor, mask: Tensor | None, lengths: Tensor | None) -> Tensor:
+        """``mask`` is ``(batch, length)``, True for real frames, and ``lengths``
+        (int32) counts them per row; both are None when every frame is real."""
         query, key, value = self.linear_q_k_v(x).split(self.size, dim=-1)
 
         keep = None if mask is None else mask[..., None].to(value.dtype)
@@ -91,14 +102,32 @@ class SANMAttention(nn.Module):
         if keep is not None:
             memory = memory * keep
 
-        attention_mask = None if mask is None else mask[:, None, None, :]
-        output = F.scaled_dot_product_attention(
-            self._split_heads(query),
-            self._split_heads(key),
-            self._split_heads(value),
-            attn_mask=attention_mask,
-        )
-        output = output.transpose(1, 2).reshape(x.shape[0], x.shape[1], self.size)
+        batch, length, _ = x.shape
+        if self.varlen and lengths is not None:
+            # Rows are laid out back to back, every ``length`` frames.
+            starts = torch.arange(
+                0, (batch + 1) * length, length, dtype=torch.int32, device=x.device
+            )
+            output = varlen_attn(
+                *(
+                    t.reshape(batch * length, self.heads, -1)
+                    for t in (query, key, value)
+                ),
+                starts,
+                starts,
+                length,
+                length,
+                seqused_k=lengths,
+            )
+        else:
+            attention_mask = None if mask is None else mask[:, None, None, :]
+            output = F.scaled_dot_product_attention(
+                self._split_heads(query),
+                self._split_heads(key),
+                self._split_heads(value),
+                attn_mask=attention_mask,
+            ).transpose(1, 2)
+        output = output.reshape(batch, length, self.size)
         return self.linear_out(output) + memory
 
 
@@ -123,8 +152,8 @@ class EncoderLayer(nn.Module):
         self.feed_forward = FeedForward(size, hidden)
         self.residual = in_size == size
 
-    def forward(self, x: Tensor, mask: Tensor | None) -> Tensor:
-        attention = self.self_attn(self.norm1(x), mask)
+    def forward(self, x: Tensor, mask: Tensor | None, lengths: Tensor | None) -> Tensor:
+        attention = self.self_attn(self.norm1(x), mask, lengths)
         # The first layer changes width (560 -> 512) and has no residual path.
         x = x + attention if self.residual else attention
         return x + self.feed_forward(self.norm2(x))
@@ -168,13 +197,14 @@ class SenseVoiceEncoder(nn.Module):
     def forward(self, x: Tensor, mask: Tensor | None) -> Tensor:
         positions = sinusoidal_positions(x.shape[1], x.shape[2], x.device)
         x = x * self.size**0.5 + positions.to(x.dtype)
+        lengths = None if mask is None else mask.sum(dim=1, dtype=torch.int32)
         for layer in self.encoders0:
-            x = layer(x, mask)
+            x = layer(x, mask, lengths)
         for layer in self.encoders:
-            x = layer(x, mask)
+            x = layer(x, mask, lengths)
         x = self.after_norm(x)
         for layer in self.tp_encoders:
-            x = layer(x, mask)
+            x = layer(x, mask, lengths)
         return self.tp_norm(x)
 
 
@@ -199,6 +229,19 @@ class SenseVoiceModel(nn.Module):
         """Encoder output for ``queries`` (batch, 4) followed by ``features``."""
         x = torch.cat((self.embed(queries).to(features.dtype), features), dim=1)
         return self.encoder(x, mask)
+
+
+def varlen_supported(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether ``varlen_attn`` (flash attention) runs on this device and dtype."""
+    if device.type != "cuda" or dtype != torch.bfloat16:
+        return False
+    x = torch.zeros((2, 1, 64), dtype=dtype, device=device)
+    starts = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    try:
+        varlen_attn(x, x, x, starts, starts, 2, 2)
+    except RuntimeError:
+        return False
+    return True
 
 
 def greedy_ctc(logits: Tensor, no_speech_id: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -308,6 +351,10 @@ class SenseVoiceTranscriber:
         )
         model.load_state_dict(state_dict)
         self.model = model.eval().to(self.device, self.dtype)
+        if varlen_supported(self.device, self.dtype):
+            for module in self.model.modules():
+                if isinstance(module, SANMAttention):
+                    module.varlen = True
 
         self.languages = {
             name: index for name, index in LANGUAGE_QUERIES.items() if name != "auto"
