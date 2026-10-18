@@ -293,9 +293,6 @@ class SenseVoiceTranscriber:
             dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         elif isinstance(dtype, str):
             dtype = DTYPES[dtype]
-        if dtype == torch.float16:
-            # Encoder activations grow past 65504 in the last layers.
-            raise ValueError("SenseVoice overflows in float16; use bfloat16 or float32")
         self.dtype = dtype
         self.max_batch_size = max_batch_size
         self.batch_wait = batch_wait_ms / 1000

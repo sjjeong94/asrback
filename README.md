@@ -38,7 +38,7 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 
 | Option | Default | |
 | --- | --- | --- |
-| `--dtype` | `bfloat16` on CUDA, else `float32` | Model precision (`float32`, `float16`, `bfloat16`); SenseVoice overflows in `float16` |
+| `--dtype` | `bfloat16` on CUDA, else `float32` | Model precision (`float32`, `bfloat16`) |
 | `--max-batch-size` | `16` (SenseVoice: `32`) | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
 | `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper: replay each decoder step from a captured CUDA graph |
@@ -101,16 +101,16 @@ uv run asrback-eval --base-url http://127.0.0.1:8000/v1 --sort-by-length
 Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 (5.4 hours of audio) with `--sort-by-length`:
 
-| Model | WER float16 | WER bfloat16 | WER float32 | Time float16 | Time bfloat16 | Time float32 |
-| --- | --- | --- | --- | --- | --- | --- |
-| whisper-tiny | 7.53% | 7.52% | 7.54% | 12.5 s | 12.9 s | 24.7 s |
-| whisper-tiny.en | 5.56% | 5.61% | 5.62% | 12.0 s | 11.6 s | 25.0 s |
-| whisper-base | 5.00% | 5.05% | 4.99% | 19.4 s | 20.7 s | 45.6 s |
-| whisper-base.en | 4.25% | 4.20% | 4.23% | 18.9 s | 19.1 s | 46.8 s |
-| whisper-small | 3.39% | 3.38% | 3.39% | 52.7 s | 54.9 s | 144.3 s |
-| whisper-small.en | 3.02% | 3.03% | 3.03% | 52.3 s | 52.3 s | 134.7 s |
-| whisper-large-v3-turbo | 2.11% | 2.07% | 2.10% | 160.3 s | 160.1 s | 401.1 s |
-| sensevoice-small | (overflows) | 3.44% | 3.45% | | 11.9 s | 18.0 s |
+| Model | WER bfloat16 | WER float32 | Time bfloat16 | Time float32 |
+| --- | --- | --- | --- | --- |
+| whisper-tiny | 7.52% | 7.54% | 12.9 s | 24.7 s |
+| whisper-tiny.en | 5.61% | 5.62% | 11.6 s | 25.0 s |
+| whisper-base | 5.05% | 4.99% | 20.7 s | 45.6 s |
+| whisper-base.en | 4.20% | 4.23% | 19.1 s | 46.8 s |
+| whisper-small | 3.38% | 3.39% | 54.9 s | 144.3 s |
+| whisper-small.en | 3.03% | 3.03% | 52.3 s | 134.7 s |
+| whisper-large-v3-turbo | 2.07% | 2.10% | 160.1 s | 401.1 s |
+| sensevoice-small | 3.44% | 3.45% | 11.9 s | 18.0 s |
 
 `--compile-encoder` brings whisper-small to 49.3 s (small.en 50.2 s) at the cost of
 about 20 s more startup; it does not help tiny or base.

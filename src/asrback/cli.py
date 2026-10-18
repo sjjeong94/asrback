@@ -32,7 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype",
-        choices=("float32", "float16", "bfloat16"),
+        choices=("float32", "bfloat16"),
         default=None,
         help="Model precision. Default: bfloat16 on CUDA, otherwise float32",
     )

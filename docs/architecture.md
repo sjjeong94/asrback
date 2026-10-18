@@ -77,7 +77,7 @@ flowchart TD
      (batch bucket × KV length bucket) pair. With `--compile-encoder`, the encoder is compiled for every
      batch bucket up front.
    - SenseVoice: `config.yaml`, the BPE model and `am.mvn` (CMVN statistics) are read, and `model.pt`
-     is loaded with `torch.load(weights_only=True)`. float16 is refused because activations overflow it.
+     is loaded with `torch.load(weights_only=True)`.
 4. **App creation and run** (`server.create_app`, `uvicorn.run`): when the app starts (lifespan), the
    AnyIO default thread limit (40) is raised to at least `8 × max_batch_size`. Section
    [4](#4-concurrency-model) explains why.
@@ -328,7 +328,7 @@ flowchart TD
   `<|...|>` special token is removed from the text.
 - **ITN**: `withitn` (14) by default, so the output includes punctuation and number normalization.
 - **dtype**: activations reach about 71,000 in the last layers, beyond the float16 maximum (65,504), so
-  the CUDA default is bfloat16 and float16 is refused.
+  the CUDA default is bfloat16.
 
 ## 7. Responses
 
