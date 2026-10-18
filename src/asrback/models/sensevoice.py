@@ -39,6 +39,8 @@ MIN_TAIL_SAMPLES = SAMPLE_RATE // 10
 HOP_LENGTH = 160  # 10 ms fbank frames, the unit of ``Segment.seek``
 # The worker picks each batch from up to this many batches' worth of queued windows.
 PENDING_FACTOR = 4
+# CTC logits are computed for at most about this many frames (batch x length) at once.
+CTC_CHUNK_FRAMES = 2048
 
 REQUIRED_FILES = (
     "model.pt",
@@ -194,9 +196,9 @@ class SenseVoiceModel(nn.Module):
         self.embed = nn.Embedding(QUERY_EMBEDDINGS, input_size)
 
     def forward(self, features: Tensor, queries: Tensor, mask: Tensor | None) -> Tensor:
-        """CTC logits for ``queries`` (batch, 4) followed by ``features``."""
+        """Encoder output for ``queries`` (batch, 4) followed by ``features``."""
         x = torch.cat((self.embed(queries).to(features.dtype), features), dim=1)
-        return self.ctc.ctc_lo(self.encoder(x, mask))
+        return self.encoder(x, mask)
 
 
 def greedy_ctc(logits: Tensor, no_speech_id: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -425,9 +427,14 @@ class SenseVoiceTranscriber:
         frames = torch.arange(QUERY_COUNT + features.shape[1], device=self.device)
         ends = lengths + QUERY_COUNT
         mask = frames[None, :] < ends[:, None] if masked else None
-        best, best_log_probs, no_speech = greedy_ctc(
-            self.model(features, queries, mask), self._no_speech_id
-        )
+        hidden = self.model(features, queries, mask)
+        # Full-vocabulary logits for a whole batch take gigabytes; do a few rows at once.
+        rows = max(1, CTC_CHUNK_FRAMES // hidden.shape[1])
+        chunks = [
+            greedy_ctc(self.model.ctc.ctc_lo(chunk), self._no_speech_id)
+            for chunk in hidden.split(rows)
+        ]
+        best, best_log_probs, no_speech = (torch.cat(parts) for parts in zip(*chunks))
         speech = (frames[None, :] >= QUERY_COUNT) & (frames[None, :] < ends[:, None])
         avg_logprobs = (best_log_probs * speech).sum(dim=1) / lengths.clamp(min=1)
         return best, avg_logprobs, no_speech
