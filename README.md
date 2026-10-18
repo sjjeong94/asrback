@@ -48,7 +48,7 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 | Option | Default | |
 | --- | --- | --- |
 | `--dtype` | `bfloat16` on CUDA, else `float32` | Model precision (`float32`, `bfloat16`) |
-| `--max-batch-size` | `16` (SenseVoice, Qwen3-ASR: `32`) | Most requests decoded together |
+| `--max-batch-size` | `16` (SenseVoice: `32`, Qwen3-ASR: `64`, `32` in float32) | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
 | `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper, Qwen3-ASR: replay each decoder step from a captured CUDA graph |
 | `--model-process` / `--no-model-process` | on | Run the model in a child process so HTTP handling does not hold up decoding |
@@ -123,8 +123,8 @@ Greedy decoding, server defaults, RTX 5060 Ti; time is the whole test-clean run
 | whisper-small.en | 3.03% | 3.03% | 52.3 s | 134.7 s |
 | whisper-large-v3-turbo | 2.07% | 2.10% | 160.1 s | 401.1 s |
 | sensevoice-small | 3.44% | 3.45% | 11.9 s | 18.0 s |
-| qwen3-asr-0.6b | 2.12% | 2.13% | 56.7 s | 166.5 s |
-| qwen3-asr-1.7b | 1.64% | 1.66%¹ | 78.5 s | 246.8 s¹ |
+| qwen3-asr-0.6b | 2.13% | 2.13% | 29.0 s | 82.2 s |
+| qwen3-asr-1.7b | 1.66% | 1.66%¹ | 49.8 s | 190.8 s¹ |
 
 ¹ `--max-batch-size 16`: in float32 the 1.7B weights and the KV cache of 32 rows do not
 fit in 16 GB.
@@ -144,8 +144,8 @@ FLEURS test, greedy decoding, bfloat16:
 | whisper-small.en | 7.77% | | |
 | whisper-large-v3-turbo | 6.13% | 3.35% | 6.07% |
 | sensevoice-small | 9.06% | 6.61% | 7.56% |
-| qwen3-asr-0.6b | 5.75% | 3.97% | 8.49% |
-| qwen3-asr-1.7b | 4.71% | 2.62% | 5.41% |
+| qwen3-asr-0.6b | 5.82% | 3.89% | 8.40% |
+| qwen3-asr-1.7b | 4.71% | 2.59% | 5.36% |
 
 Smaller models sometimes repeat a phrase until the token limit, especially in
 Japanese; without temperature fallback (see below) these loops dominate their error

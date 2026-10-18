@@ -39,6 +39,7 @@ from ..transcription import (
     Transcription,
     compression_ratio,
     gather_batch,
+    to_device,
 )
 
 SAMPLE_RATE = asrfront.qwen3_asr.SAMPLE_RATE
@@ -53,9 +54,17 @@ EOS_CHECK_INTERVAL = 4
 # Positions per row of the KV cache: prompt (about 400 tokens for 30 s of audio)
 # plus generated tokens.
 CACHE_LENGTH = 1024
-# Attention lengths with their own CUDA graph, besides CACHE_LENGTH.
+# Attention lengths with their own CUDA graph, besides CACHE_LENGTH (without
+# varlen_attn, which reads only the keys each row has).
 KV_BUCKETS = (128, 256, 512, 768)
 MAX_NEW_TOKENS = 512
+# Parts each row's keys are split into for a decoder step's flash attention (one
+# query per row); the kernel's own choice was about 20% slower at 32 and 64 rows.
+DECODE_KV_SPLITS = 4
+# 100-frame chunks per convolution call. The checkpoint's ``conv_chunksize`` (500)
+# takes about 3 GB of activations at once, which crowds out larger batches; smaller
+# calls run as fast.
+CONV_CHUNKS = 64
 # The request's ``prompt`` (the system message) keeps at most its last this many tokens.
 MAX_CONTEXT_TOKENS = 224
 # Output repeating a character or a short pattern more often than this is collapsed.
@@ -126,7 +135,7 @@ class Segments:
     def from_lengths(
         cls, lengths: list[int], device: torch.device, varlen: bool
     ) -> Segments:
-        sizes = torch.tensor(lengths, device=device)
+        sizes = to_device(lengths, device)
         starts = F.pad(sizes.cumsum(0), (1, 0)).to(torch.int32)
         segments = cls(starts, max(lengths), varlen)
         if not varlen:
@@ -260,12 +269,11 @@ class AudioEncoder(nn.Module):
         self.proj2 = nn.Linear(width, config["output_dim"])
         self.chunk_frames = 2 * config["n_window"]
         self.window_chunks = config["n_window_infer"] // self.chunk_frames
-        self.conv_batch = config["conv_chunksize"]
 
     def forward(
         self,
         chunks: Tensor,
-        chunk_tokens: Tensor,
+        chunk_tokens: np.ndarray,
         window_tokens: list[int],
         varlen: bool,
     ) -> Tensor:
@@ -273,10 +281,11 @@ class AudioEncoder(nn.Module):
 
         ``chunks`` is ``(chunks, n_mels, chunk_frames)``, every window's chunks in
         order, a window's last chunk zero-padded; ``chunk_tokens`` counts each
-        chunk's valid tokens and ``window_tokens`` each window's.
+        chunk's valid tokens and ``window_tokens`` each window's. Index tensors
+        are built on the host, so nothing here waits for the GPU.
         """
         outputs = []
-        for part in chunks[:, None].split(self.conv_batch):
+        for part in chunks[:, None].split(CONV_CHUNKS):
             x = F.gelu(self.conv2d1(part))
             x = F.gelu(self.conv2d2(x))
             outputs.append(F.gelu(self.conv2d3(x)))
@@ -285,7 +294,8 @@ class AudioEncoder(nn.Module):
         x = self.conv_out(x.permute(0, 3, 1, 2).reshape(count, length, channels * bins))
         # Positions restart in every chunk.
         x = x + self.positional_embedding[:length].to(x.dtype)
-        x = x[torch.arange(length, device=x.device) < chunk_tokens[:, None]]
+        valid = np.flatnonzero(np.arange(length) < chunk_tokens[:, None])
+        x = x.flatten(0, 1)[to_device(valid, x.device)]
 
         # Attention windows of ``window_chunks`` chunks within each audio window.
         span = self.window_chunks * length
@@ -307,8 +317,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        variance = x.float().pow(2).mean(-1, keepdim=True)
-        return self.weight * (x.float() * torch.rsqrt(variance + self.eps)).to(x.dtype)
+        return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
 
 
 def rotate(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -342,9 +351,11 @@ class TextAttention(nn.Module):
         self.head_dim = config["head_dim"]
         self.heads = config["num_attention_heads"]
         self.kv_heads = config["num_key_value_heads"]
-        self.q_proj = nn.Linear(width, self.heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(width, self.kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(width, self.kv_heads * self.head_dim, bias=False)
+        self.sizes = [
+            size * self.head_dim for size in (self.heads, self.kv_heads, self.kv_heads)
+        ]
+        # The checkpoint's q_proj, k_proj and v_proj as one matrix.
+        self.qkv_proj = nn.Linear(width, sum(self.sizes), bias=False)
         self.o_proj = nn.Linear(self.heads * self.head_dim, width, bias=False)
         self.q_norm = RMSNorm(self.head_dim, config["rms_norm_eps"])
         self.k_norm = RMSNorm(self.head_dim, config["rms_norm_eps"])
@@ -352,9 +363,10 @@ class TextAttention(nn.Module):
     def _project(self, x: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, ...]:
         """``(tokens, heads, head_dim)`` queries, keys and values for ``(tokens, width)``."""
         shape = (len(x), -1, self.head_dim)
-        q = rotate(self.q_norm(self.q_proj(x).view(shape)), cos, sin)
-        k = rotate(self.k_norm(self.k_proj(x).view(shape)), cos, sin)
-        return q, k, self.v_proj(x).view(shape)
+        q, k, v = self.qkv_proj(x).split(self.sizes, dim=-1)
+        q = rotate(self.q_norm(q.reshape(shape)), cos, sin)
+        k = rotate(self.k_norm(k.reshape(shape)), cos, sin)
+        return q, k, v.reshape(shape)
 
     def prefill(
         self,
@@ -380,15 +392,35 @@ class TextAttention(nn.Module):
         keys: Tensor,
         values: Tensor,
         positions: Tensor,
-        mask: Tensor,
+        mask: Tensor | tuple[Tensor, Tensor, Tensor],
         cos: Tensor,
         sin: Tensor,
     ) -> Tensor:
-        """One token per row at its own position, attending over the cache."""
+        """One token per row at its own position, attending over the cache.
+
+        ``mask`` is ``(batch, 1, 1, length)``, or for ``varlen_attn`` over whole
+        cache rows: the query starts, each row's start in the flattened cache,
+        and each row's key count.
+        """
         q, k, v = self._project(x, cos, sin)
         rows = torch.arange(len(x), device=x.device)
         keys[rows, positions] = k
         values[rows, positions] = v
+        if isinstance(mask, tuple):
+            query_starts, key_starts, lengths = mask
+            output = varlen_attn(
+                q,
+                keys.flatten(0, 1),
+                values.flatten(0, 1),
+                query_starts,
+                key_starts,
+                1,
+                keys.shape[1],
+                enable_gqa=True,
+                seqused_k=lengths,
+                num_splits=DECODE_KV_SPLITS,
+            )
+            return self.o_proj(output.flatten(1))
         # The query heads sharing a key/value head attend as one group of queries.
         q = q.view(len(x), self.kv_heads, -1, self.head_dim)
         output = F.scaled_dot_product_attention(
@@ -401,12 +433,13 @@ class TextMLP(nn.Module):
     def __init__(self, config: dict) -> None:
         super().__init__()
         width, hidden = config["hidden_size"], config["intermediate_size"]
-        self.gate_proj = nn.Linear(width, hidden, bias=False)
-        self.up_proj = nn.Linear(width, hidden, bias=False)
+        # The checkpoint's gate_proj and up_proj as one matrix.
+        self.gate_up_proj = nn.Linear(width, 2 * hidden, bias=False)
         self.down_proj = nn.Linear(hidden, width, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class DecoderLayer(nn.Module):
@@ -462,13 +495,21 @@ class TextModel(nn.Module):
         cache: KVCache,
         cos: Tensor,
         sin: Tensor,
+        varlen: bool,
     ) -> Tensor:
         """Hidden states for one token per row (``tokens``, ``positions``: (batch,))
-        over a fixed-shape cache view; ``cos``/``sin`` are the full tables."""
+        over a fixed-shape cache view; ``cos``/``sin`` are the full tables. With
+        ``varlen``, the view holds whole cache rows and each row reads only its
+        keys up to its position."""
         x = self.embed_tokens(tokens)
         cos, sin = cos[positions], sin[positions]
-        key_positions = torch.arange(cache.keys.shape[2], device=x.device)
-        mask = (key_positions[None, :] <= positions[:, None])[:, None, None, :]
+        length = cache.keys.shape[2]
+        if varlen:
+            starts = torch.arange(len(x) + 1, dtype=torch.int32, device=x.device)
+            mask = (starts, starts * length, (positions + 1).to(torch.int32))
+        else:
+            key_positions = torch.arange(length, device=x.device)
+            mask = (key_positions[None, :] <= positions[:, None])[:, None, None, :]
         for index, layer in enumerate(self.layers):
             keys, values = cache.keys[index], cache.values[index]
             x = layer(
@@ -490,7 +531,8 @@ class Thinker(nn.Module):
 
 
 class Qwen3ASRForConditionalGeneration(nn.Module):
-    """Module names match the Hugging Face checkpoint (``thinker.*``)."""
+    """Module names match the Hugging Face checkpoint (``thinker.*``), except for
+    the projections :func:`fuse_projections` joins."""
 
     def __init__(self, config: dict) -> None:
         super().__init__()
@@ -500,6 +542,27 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 def load_json(path: Path) -> dict:
     with path.open(encoding="utf-8") as file:
         return json.load(file)
+
+
+# Checkpoint projections loaded as one matrix: fewer, larger matrix multiplications.
+FUSED_PROJECTIONS = {
+    "self_attn.qkv_proj": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
+    "mlp.gate_up_proj": ("mlp.gate_proj", "mlp.up_proj"),
+}
+
+
+def fuse_projections(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Join the text model's projection weights as :data:`FUSED_PROJECTIONS` lists."""
+    for name in list(state_dict):
+        for fused, parts in FUSED_PROJECTIONS.items():
+            if name.startswith("thinker.model.") and name.endswith(
+                f".{parts[0]}.weight"
+            ):
+                prefix = name[: -len(f"{parts[0]}.weight")]
+                state_dict[f"{prefix}{fused}.weight"] = torch.cat(
+                    [state_dict.pop(f"{prefix}{part}.weight") for part in parts]
+                )
+    return state_dict
 
 
 def load_tokenizer(model_dir: Path) -> Tokenizer:
@@ -642,7 +705,8 @@ class Qwen3ASRTranscriber:
     hears before the transcript; with one, the prompt names it. ``prompt`` becomes
     the system message (context such as names or terms). Translation is not
     supported. ``cuda_graphs`` (default: on for CUDA) replays each decoder step
-    from a captured graph.
+    from a captured graph. ``max_batch_size`` defaults to 64 in bfloat16 and 32 in
+    float32, whose KV cache takes twice the memory.
     """
 
     def __init__(
@@ -650,7 +714,7 @@ class Qwen3ASRTranscriber:
         model_dir: str | os.PathLike,
         device: str | None = None,
         dtype: str | torch.dtype | None = None,
-        max_batch_size: int = 32,
+        max_batch_size: int | None = None,
         batch_wait_ms: float = 5.0,
         cuda_graphs: bool | None = None,
     ):
@@ -658,7 +722,7 @@ class Qwen3ASRTranscriber:
         for filename in REQUIRED_FILES:
             if not (model_dir / filename).is_file():
                 raise FileNotFoundError(f"Missing model file: {model_dir / filename}")
-        if max_batch_size <= 0:
+        if max_batch_size is not None and max_batch_size <= 0:
             raise ValueError("max_batch_size must be greater than zero")
         if batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be non-negative")
@@ -680,6 +744,8 @@ class Qwen3ASRTranscriber:
         if cuda_graphs and self.device.type != "cuda":
             raise ValueError("cuda_graphs requires a CUDA device")
         self.cuda_graphs = cuda_graphs
+        if max_batch_size is None:
+            max_batch_size = 64 if dtype == torch.bfloat16 else 32
         self.max_batch_size = max_batch_size
         self.batch_wait = batch_wait_ms / 1000
 
@@ -737,7 +803,10 @@ class Qwen3ASRTranscriber:
             }
             | {max_batch_size}
         )
-        self._kv_buckets = sorted(set(KV_BUCKETS) | {CACHE_LENGTH})
+        # varlen_attn reads only each row's keys, so it needs no shorter views.
+        self._kv_buckets = sorted(
+            {CACHE_LENGTH} if self._varlen else set(KV_BUCKETS) | {CACHE_LENGTH}
+        )
         shape = (
             text["num_hidden_layers"],
             max_batch_size,
@@ -772,7 +841,7 @@ class Qwen3ASRTranscriber:
             if not path.is_file():
                 raise FileNotFoundError(f"Missing model file: {path}")
             state_dict.update(load_file(str(path), device="cpu"))
-        return state_dict
+        return fuse_projections(state_dict)
 
     def _encode_text(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False).ids
@@ -826,7 +895,7 @@ class Qwen3ASRTranscriber:
         segments = []
         detected = None
         for seek, length, job in windows:
-            result: _Result = job.future.result()
+            result = self._parse(*job.future.result(), job.language)
             detected = detected or result.language
             segments.append(
                 Segment(
@@ -932,8 +1001,8 @@ class Qwen3ASRTranscriber:
                 index += 1
         chunk_tokens = asrfront.qwen3_asr.num_audio_tokens(np.array(chunk_frames))
         return self._audio(
-            torch.from_numpy(chunks).to(self.device, self.dtype),
-            torch.as_tensor(chunk_tokens, device=self.device),
+            to_device(chunks, self.device).to(self.dtype),
+            chunk_tokens,
             window_tokens,
             self._varlen,
         )
@@ -945,19 +1014,35 @@ class Qwen3ASRTranscriber:
         slots = [slot for slot in range(self.max_batch_size) if slot not in self._rows]
         slots = slots[: len(jobs)]
         try:
+            # Built on the host: a transfer from GPU (or from pageable memory) here
+            # would wait for the work queued before it.
             prompts = [self._prompt(job) for job in jobs]
             lengths = [len(prompt) for prompt in prompts]
-            ids = torch.tensor(
-                [token for prompt in prompts for token in prompt], device=self.device
+            ids = np.concatenate(prompts)
+            offsets = np.cumsum(lengths) - lengths
+            positions = np.arange(len(ids)) - np.repeat(offsets, lengths)
+            # The first token sits at ``prompt_length``; a row may write up to ``end``.
+            limits = [
+                min(job.max_new_tokens or MAX_NEW_TOKENS, CACHE_LENGTH - length)
+                for job, length in zip(jobs, lengths)
+            ]
+            ends = [length - 1 + limit for length, limit in zip(lengths, limits)]
+            audio = np.flatnonzero(ids == self._audio_id)
+            ids, rows, positions, audio, slot_rows, start, end = (
+                to_device(data, self.device)
+                for data in (
+                    ids,
+                    np.repeat(slots, lengths),
+                    positions,
+                    audio,
+                    slots,
+                    lengths,
+                    ends,
+                )
             )
-            rows = torch.tensor(slots, device=self.device).repeat_interleave(
-                torch.tensor(lengths, device=self.device)
-            )
-            positions = torch.cat(
-                [torch.arange(length, device=self.device) for length in lengths]
-            )
+
             x = self._text.embed_tokens(ids)
-            x[ids == self._audio_id] = self._encode_audio(jobs).to(x.dtype)
+            x[audio] = self._encode_audio(jobs).to(x.dtype)
             segments = Segments.from_lengths(lengths, self.device, self._varlen)
             hidden = self._text.prefill(
                 x,
@@ -972,15 +1057,6 @@ class Qwen3ASRTranscriber:
             logits = self._lm_head(hidden[last]).float()
             token, logprob = self._choose(logits, self._temperatures(jobs))
 
-            # The first token sits at ``prompt_length``; a row may write up to ``end``.
-            limits = [
-                min(job.max_new_tokens or MAX_NEW_TOKENS, CACHE_LENGTH - length)
-                for job, length in zip(jobs, lengths)
-            ]
-            ends = [length - 1 + limit for length, limit in zip(lengths, limits)]
-            slot_rows = torch.tensor(slots, device=self.device)
-            start = torch.tensor(lengths, device=self.device)
-            end = torch.tensor(ends, device=self.device)
             state = self._state
             state.tokens[slot_rows] = token
             state.position[slot_rows] = start
@@ -1004,7 +1080,7 @@ class Qwen3ASRTranscriber:
         values = [job.temperature if job is not None else 0.0 for job in jobs]
         if not any(value > 0 for value in values):
             return None
-        return torch.tensor(values, device=self.device)
+        return to_device(values, self.device)
 
     @torch.inference_mode()
     def _advance(self) -> None:
@@ -1056,13 +1132,11 @@ class Qwen3ASRTranscriber:
             tokens = tokens[row.prompt_length : position + 1]
             if tokens and tokens[-1] in eos:
                 tokens.pop()
-            avg_logprob = sum_logprob / (len(tokens) + 1)
-            row.job.future.set_result(
-                self._parse(tokens, row.job.language, avg_logprob)
-            )
+            # Parsed by the request's thread, so the worker can go on with the GPU.
+            row.job.future.set_result((tokens, sum_logprob / (len(tokens) + 1)))
 
     def _parse(
-        self, tokens: list[int], language: str | None, avg_logprob: float
+        self, tokens: list[int], avg_logprob: float, language: str | None
     ) -> _Result:
         """Split ``language <Name><asr_text><text>`` (or just the text, when the
         prompt named the language) into the language code and the text."""
@@ -1095,7 +1169,7 @@ class Qwen3ASRTranscriber:
     ) -> None:
         """Decode ``state.tokens`` and select the next token for every row."""
         hidden = self._text.step(
-            state.tokens, state.position, cache, self._cos, self._sin
+            state.tokens, state.position, cache, self._cos, self._sin, self._varlen
         )
         logits = self._lm_head(hidden).float()
         token, logprob = self._choose(logits, temperatures)

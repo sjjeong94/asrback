@@ -73,7 +73,7 @@ flowchart TD
 ```
 
 1. **Argument parsing** (`cli.parse_args`): `--max-batch-size` defaults to `None`, which means the
-   model's own default (16 for Whisper, 32 for SenseVoice and Qwen3-ASR).
+   model's own default (16 for Whisper, 32 for SenseVoice, 64 for Qwen3-ASR or 32 in float32).
 2. **Model process** (`model_process.ProcessTranscriber`, on by default): the steps below run in a
    child process started with `spawn`. The server process keeps only a proxy with the same interface
    (`transcribe`, `languages`, `max_batch_size`, ...); errors while loading are sent back and raised
@@ -444,7 +444,7 @@ Qwen3-ASR's chat template, with `N = asrfront.qwen3_asr.num_audio_tokens(frames)
 
 The model writes `language <Name><asr_text><transcript>` and stops at `<|im_end|>` or `<|endoftext|>`.
 With a request language, `language <Name><asr_text>` is already part of the prompt and the model writes
-only the transcript. `_parse` takes the language from the tokens before `<asr_text>` (`language None`,
+only the transcript. `_parse`, run by the request's thread rather than the worker, takes the language from the tokens before `<asr_text>` (`language None`,
 the model's answer for audio without speech, sets `no_speech_prob` to 1); the text is the rest, decoded,
 with repeated characters or short patterns (more than 20 times in a row) collapsed as qwen-asr does.
 `avg_logprob` counts every generated token, including the language prefix and the end token.
@@ -463,6 +463,11 @@ flowchart TD
 - **Packing**: prompts differ in length (the audio part grows with the window), so they are not padded:
   linear layers run on all tokens at once and `varlen_attn` keeps each prompt's attention to itself.
   On CPU or with float32, the same call becomes one padded `scaled_dot_product_attention` with a mask.
+- **No waiting on the GPU**: token ids, cache rows and positions, the indices of the audio tokens and of
+  each chunk's valid tokens are built with NumPy and copied from pinned memory (`to_device`). A copy
+  from pageable memory, or a boolean mask on the GPU, would wait for every step queued before it.
+- **Convolutions** run 64 chunks at a time; the checkpoint's `conv_chunksize` (500) needs about 3 GB of
+  activations at once, which leaves less room for the KV cache.
 - **The KV cache** (`KVCache`) is two preallocated tensors shaped
   `(layers, max_batch_size, 1024, kv_heads, head_dim)`. A row's prompt and generated tokens share its
   1024 positions; `limit = min(max_new_tokens or 512, 1024 - prompt_length)`.
@@ -470,12 +475,16 @@ flowchart TD
 ### 7.4 Worker: decoder steps
 
 As in Whisper (section [5.3](#53-worker-admitting-windows-and-decoder-steps)): `_advance` runs up to 4
-steps over the smallest batch bucket that covers the occupied rows and the shortest KV length bucket
-(128, 256, 512, 768, 1024) that covers their next steps, from a CUDA graph when every occupied row is
-greedy; `_finish` transfers the finished flags once and returns the finished rows' results.
+steps over the smallest batch bucket that covers the occupied rows, from a CUDA graph when every
+occupied row is greedy; `_finish` transfers the finished flags once and returns the finished rows'
+tokens.
 
-One step decodes each row's token at its own position: the key and value go to that position of the
-row, and the query attends to positions up to it through a `(batch, 1, 1, length)` mask. The query heads
+One step decodes each row's token at its own position, and the key and value go to that position of
+the row. With CUDA and bfloat16, the query attends with `varlen_attn` over the row's whole cache
+(flattened to `(rows × 1024, kv_heads, head_dim)`) with `seqused_k = position + 1`, so it reads only
+the keys the row has, and the key/value heads are split in 4 parts (`num_splits`), which was about 20%
+faster than the kernel's own choice. Otherwise it attends through a `(batch, 1, 1, length)` mask over
+the shortest KV length bucket (128, 256, 512, 768, 1024) that covers the next steps; the query heads
 that share a key/value head (grouped-query attention, 16 query and 8 key/value heads) are passed to
 `scaled_dot_product_attention` as one group of queries for that head, so no keys are repeated.
 
@@ -487,7 +496,7 @@ that share a key/value head (grouped-query attention, 16 query and 8 key/value h
 | Audio encoder | per 100-frame chunk (the last zero-padded): 3 × (Conv2d k=3 stride 2 → GELU) → linear → sinusoidal positions restarting in every chunk → 13 tokens; Transformer layers (18 for 0.6B, 24 for 1.7B) attending within windows of 8 chunks (8 s, 104 tokens) → LayerNorm → linear → GELU → linear to the LLM width |
 | Language model | Qwen3: RMSNorm, attention with per-head RMSNorm on queries and keys, RoPE (θ = 10⁶; the multimodal RoPE reduces to it for text positions), SwiGLU MLP; 28 layers |
 | Output | `lm_head` (not tied to the embeddings in these checkpoints) |
-| Weights | names match the Hugging Face checkpoint (`thinker.audio_tower...`, `thinker.model...`, `thinker.lm_head`) |
+| Weights | names match the Hugging Face checkpoint (`thinker.audio_tower...`, `thinker.model...`, `thinker.lm_head`), except that the language model's `q_proj`/`k_proj`/`v_proj` and `gate_proj`/`up_proj` are joined into `qkv_proj` and `gate_up_proj` when loaded |
 
 The encoder attends within 8-second windows (`n_window_infer`), as qwen-asr's vLLM backend and its
 transformers backend with flash attention do. Its transformers backend with SDPA ignores those windows
@@ -575,7 +584,7 @@ the results.
 | Item | Whisper | SenseVoice | Qwen3-ASR |
 | --- | --- | --- | --- |
 | dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) |
-| `max_batch_size` | 16 | 32 | 32 |
+| `max_batch_size` | 16 | 32 | 64 (32 in float32) |
 | `batch_wait_ms` | 5 | 5 | 5 |
 | Model process | on (`--no-model-process` to load in the server process) | on | on |
 | CUDA graphs | on with CUDA (decoder steps) | none | on with CUDA (decoder steps) |

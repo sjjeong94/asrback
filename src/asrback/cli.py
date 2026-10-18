@@ -42,7 +42,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Most concurrent requests decoded together. "
-        "Default: 16 for Whisper, 32 for SenseVoice and Qwen3-ASR",
+        "Default: 16 for Whisper, 32 for SenseVoice, 64 for Qwen3-ASR "
+        "(32 in float32)",
     )
     parser.add_argument(
         "--batch-wait-ms",

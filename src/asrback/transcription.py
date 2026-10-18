@@ -48,6 +48,15 @@ def compression_ratio(text: str) -> float:
     return len(data) / len(zlib.compress(data)) if data else 0.0
 
 
+def to_device(data, device: torch.device) -> torch.Tensor:
+    """``data`` (an array or a list) copied to ``device`` without waiting for the
+    work queued there, as a copy from pageable memory would."""
+    tensor = torch.as_tensor(data)
+    if device.type == "cuda":
+        tensor = tensor.pin_memory()
+    return tensor.to(device, non_blocking=True)
+
+
 def gather_batch(jobs: queue.SimpleQueue, max_size: int, wait: float) -> list:
     """Block for one job, then take more until ``max_size`` or ``wait`` seconds."""
     batch = [jobs.get()]
