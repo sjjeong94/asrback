@@ -2,7 +2,9 @@
 SafeTensors weights, and greedy / sampled decoding over 30-second audio windows.
 
 Concurrent requests are decoded together: callers queue one window at a time and a
-single worker thread runs them in batches.
+single worker thread decodes them in a pool of rows (continuous batching). Between
+groups of decoder steps, finished rows return their result and queued windows take
+the free rows, so a batch never waits for its longest row.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import os
 import queue
 import re
 import threading
+from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -153,12 +156,27 @@ class DecoderCache:
     def narrow(self, batch_size: int, length: int | None = None) -> DecoderCache:
         """A view of the first ``batch_size`` rows (and self-attention positions)
         sharing the same storage."""
+        return self.rows(0, batch_size, length)
+
+    def rows(self, start: int, stop: int, length: int | None = None) -> DecoderCache:
+        """A view of rows ``start:stop`` (and self-attention positions)."""
         return DecoderCache(
-            self.self_keys[:, :batch_size, :, :length],
-            self.self_values[:, :batch_size, :, :length],
-            self.cross_keys[:, :batch_size],
-            self.cross_values[:, :batch_size],
+            self.self_keys[:, start:stop, :, :length],
+            self.self_values[:, start:stop, :, :length],
+            self.cross_keys[:, start:stop],
+            self.cross_values[:, start:stop],
         )
+
+    def copy_rows(self, source: DecoderCache, rows: Tensor, length: int) -> None:
+        """Copy every row of ``source`` (its first ``length`` self-attention
+        positions) into rows ``rows`` of this cache."""
+        for target, values in (
+            (self.self_keys[:, :, :, :length], source.self_keys[:, :, :, :length]),
+            (self.self_values[:, :, :, :length], source.self_values[:, :, :, :length]),
+            (self.cross_keys, source.cross_keys),
+            (self.cross_values, source.cross_values),
+        ):
+            target.index_copy_(1, rows, values)
 
 
 class DecoderLayer(nn.Module):
@@ -186,10 +204,15 @@ class DecoderLayer(nn.Module):
 
         hidden = self.self_attn_layer_norm(x)
         key, value = self.self_attn.project_key_value(hidden)
-        self_keys.index_copy_(2, positions, key)
-        self_values.index_copy_(2, positions, value)
-        if length is not None:
-            # Eager: attend to the filled prefix; a multi-token input starts at 0.
+        if length is None:
+            # Fixed-shape step: one token per row, each at its own position.
+            index = positions[:, None, None, None].expand_as(key)
+            self_keys.scatter_(2, index, key)
+            self_values.scatter_(2, index, value)
+        else:
+            # Eager: tokens at shared positions; attend to the filled prefix.
+            self_keys.index_copy_(2, positions, key)
+            self_values.index_copy_(2, positions, value)
             self_keys = self_keys[:, :, :length]
             self_values = self_values[:, :, :length]
         x = x + self.self_attn.attend(
@@ -215,12 +238,15 @@ class WhisperDecoder(nn.Module):
     def forward(
         self, tokens: Tensor, positions: Tensor, cache: DecoderCache, length: int | None
     ) -> Tensor:
-        x = self.embed_tokens(tokens) + self.embed_positions(positions)
         mask = None
         if length is None:
-            # Fixed-shape step over the whole cache: hide positions not yet written.
+            # Fixed-shape step over the whole cache, one position per row: hide
+            # positions not yet written.
+            x = self.embed_tokens(tokens) + self.embed_positions(positions)[:, None]
             key_positions = torch.arange(cache.self_keys.shape[3], device=x.device)
-            mask = key_positions[None, :] <= positions[:, None]
+            mask = (key_positions[None, :] <= positions[:, None])[:, None, None, :]
+        else:
+            x = self.embed_tokens(tokens) + self.embed_positions(positions)
         for index, layer in enumerate(self.layers):
             layer_cache = (
                 cache.self_keys[index],
@@ -282,8 +308,10 @@ class WhisperForConditionalGeneration(nn.Module):
     ) -> Tensor:
         """Decoder hidden states for ``tokens`` at ``positions``.
 
-        ``length`` is the number of filled cache positions after this call, and
-        is ``None`` for a fixed-shape (CUDA graph) step that masks the full cache.
+        ``length`` is the number of filled cache positions after this call, for
+        tokens ``(batch, n)`` at positions ``(n,)`` shared by every row. It is
+        ``None`` for a fixed-shape (CUDA graph) step: tokens ``(batch, 1)`` at
+        positions ``(batch,)``, one per row, attending over the whole cache.
         """
         return self.model.decoder(tokens, positions, cache, length)
 
@@ -337,17 +365,31 @@ class _Result:
 
 
 @dataclass
+class _Row:
+    """Host-side bookkeeping for an occupied row of the decoding pool."""
+
+    job: _Job
+    language: str
+    prefix_length: int
+    end: int  # last position the row may write
+    bound: int  # upper bound of the row's current position
+
+
+@dataclass
 class _DecodeState:
     """Per-row decoding state, updated in place by every step.
 
-    ``position`` holds the position of ``tokens`` (the latest token); a step
-    writes its new token to ``generated`` at ``position + 1``.
+    ``position`` holds each row's position of ``tokens`` (its latest token); a
+    step writes the row's next token to ``generated`` at ``position + 1``.
+    Finished rows, and free rows (marked finished), keep their token and position.
     """
 
     tokens: Tensor  # (batch, 1)
-    position: Tensor  # (1,)
+    position: Tensor  # (batch,)
+    end: Tensor  # (batch,), the last position a row may write
     finished: Tensor  # (batch,)
     sum_logprobs: Tensor  # (batch,)
+    no_speech_probs: Tensor  # (batch,), set when a row starts
     generated: Tensor  # (batch, max_target_positions)
 
     @classmethod
@@ -356,8 +398,10 @@ class _DecodeState:
     ) -> _DecodeState:
         return cls(
             torch.zeros((batch_size, 1), dtype=torch.long, device=device),
-            torch.zeros(1, dtype=torch.long, device=device),
-            torch.zeros(batch_size, dtype=torch.bool, device=device),
+            torch.zeros(batch_size, dtype=torch.long, device=device),
+            torch.zeros(batch_size, dtype=torch.long, device=device),
+            torch.ones(batch_size, dtype=torch.bool, device=device),
+            torch.zeros(batch_size, device=device),
             torch.zeros(batch_size, device=device),
             torch.zeros((batch_size, max_target), dtype=torch.long, device=device),
         )
@@ -365,11 +409,19 @@ class _DecodeState:
     def narrow(self, batch_size: int) -> _DecodeState:
         return _DecodeState(
             self.tokens[:batch_size],
-            self.position,
+            self.position[:batch_size],
+            self.end[:batch_size],
             self.finished[:batch_size],
             self.sum_logprobs[:batch_size],
+            self.no_speech_probs[:batch_size],
             self.generated[:batch_size],
         )
+
+    def free(self, rows: Tensor) -> None:
+        """Mark ``rows`` free: finished, at position 0."""
+        self.finished[rows] = True
+        self.position[rows] = 0
+        self.tokens[rows] = 0
 
 
 class _Graph:
@@ -395,10 +447,11 @@ class _Graph:
 class Transcriber:
     """Loads a Whisper checkpoint once and transcribes or translates audio.
 
-    ``transcribe`` is thread-safe: windows from concurrent calls are decoded in
-    batches of up to ``max_batch_size``, waiting at most ``batch_wait_ms`` for a
-    batch to fill. ``cuda_graphs`` (default: on for CUDA) replays each decoder step
-    from a captured graph instead of launching its kernels one by one.
+    ``transcribe`` is thread-safe: windows from concurrent calls are decoded
+    together in a pool of ``max_batch_size`` rows; when the pool is empty, the
+    worker waits at most ``batch_wait_ms`` for more windows to arrive.
+    ``cuda_graphs`` (default: on for CUDA) replays each decoder step from a
+    captured graph instead of launching its kernels one by one.
     ``compile_encoder`` compiles the encoder with ``torch.compile`` for every
     batch size up front, which slows startup. With ``condition_on_previous_text``
     off, a window sees only the prompt instead of the text before it, so the
@@ -506,8 +559,14 @@ class Transcriber:
         self.compile_encoder = compile_encoder
         if compile_encoder:
             self._compile_encoder()
-        self._cache: DecoderCache | None = None
-        self._state: _DecodeState | None = None
+        # The pool of rows being decoded, and a staging cache where new windows
+        # run their prompt before moving into free rows.
+        self._cache = self.model.allocate_cache(max_batch_size)
+        self._staging = self.model.allocate_cache(max_batch_size)
+        self._state = _DecodeState.allocate(
+            max_batch_size, self.config["max_target_positions"], self.device
+        )
+        self._rows: dict[int, _Row] = {}
         self._graphs: dict[tuple[int, int], _Graph] = {}
         if self.cuda_graphs:
             self._capture_graphs()
@@ -644,41 +703,52 @@ class Transcriber:
     def _capture_graphs(self) -> None:
         if self.device.index is not None:
             torch.cuda.set_device(self.device)
-        self._cache = self.model.allocate_cache(self.max_batch_size)
-        self._state = _DecodeState.allocate(
-            self.max_batch_size, self.config["max_target_positions"], self.device
-        )
-        # One greedy step per (batch size, self-attention length) pair.
+        # One greedy step per (batch size, self-attention length) pair. Warm-up
+        # steps advance active rows; keep them inside the shortest length.
         for batch_size in self._buckets:
             state = self._state.narrow(batch_size)
             for length in self._kv_buckets:
                 cache = self._cache.narrow(batch_size, length)
-                # Warm-up steps advance the position; keep them inside ``length``.
-                self._state.position.zero_()
+                state.finished.zero_()
+                state.position.zero_()
+                state.end.fill_(self.config["max_target_positions"] - 1)
                 self._graphs[batch_size, length] = _Graph(
                     lambda state=state, cache=cache: self._step(state, cache)
                 )
+        self._state.free(torch.arange(self.max_batch_size, device=self.device))
 
     def _serve(self) -> None:
-        """Worker loop: gather queued windows into batches and decode them."""
+        """Worker loop: move queued windows into free rows, run decoder steps,
+        and return the results of finished rows."""
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
+        pending: deque[_Job] = deque()
         while True:
-            jobs = gather_batch(self._queue, self.max_batch_size, self.batch_wait)
-
-            # Rows of a batch must share the prefix length and token budget.
-            groups: dict[tuple[int, int], list[_Job]] = {}
-            for job in jobs:
-                groups.setdefault(self._layout(job), []).append(job)
-            for (prefix_length, limit), group in groups.items():
+            if not self._rows and not pending:
+                pending.extend(
+                    gather_batch(self._queue, self.max_batch_size, self.batch_wait)
+                )
+            while True:
                 try:
-                    results = self._decode_batch(group, prefix_length, limit)
-                except BaseException as exc:
-                    for job in group:
-                        job.future.set_exception(exc)
-                    continue
-                for job, result in zip(group, results):
-                    job.future.set_result(result)
+                    pending.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            free = self.max_batch_size - len(self._rows)
+            if pending and free:
+                jobs = [pending.popleft() for _ in range(min(free, len(pending)))]
+                self._admit(jobs)
+            if not self._rows:
+                continue
+            try:
+                self._advance()
+                self._finish()
+            except BaseException as exc:
+                # A failed step leaves every row's state unknown: fail them all.
+                rows = list(self._rows)
+                for slot in rows:
+                    self._rows.pop(slot).job.future.set_exception(exc)
+                self._state.free(torch.tensor(rows, device=self.device))
 
     def _sot(self, language: str, task: str) -> list[int]:
         sot = [self.start_id]
@@ -694,28 +764,62 @@ class Transcriber:
         return prefix_length, min(job.max_new_tokens or available, available)
 
     @torch.inference_mode()
-    def _decode_batch(
-        self, jobs: list[_Job], prefix_length: int, limit: int
-    ) -> list[_Result]:
-        batch_size = len(jobs)
-        encoder_output = self._encode([job.log_mel for job in jobs])
+    def _admit(self, jobs: list[_Job]) -> None:
+        """Encode new windows, run their prompts and pick their first tokens in
+        the staging cache, then move them into free rows of the pool.
 
-        if self.cuda_graphs:
-            bucket = next(size for size in self._buckets if size >= batch_size)
-        elif self._cache is None or self._cache.batch_size < batch_size:
-            self._cache = self.model.allocate_cache(batch_size)
-            self._state = _DecodeState.allocate(
-                batch_size, self.config["max_target_positions"], self.device
-            )
-        cache = self._cache.narrow(batch_size)
-        state = self._state.narrow(batch_size)
-        self.model.set_encoder_output(cache, encoder_output)
+        Windows with the same prefix length share a prompt pass; after that, rows
+        of any prefix length decode together.
+        """
+        jobs.sort(key=self._layout)
+        slots = [slot for slot in range(self.max_batch_size) if slot not in self._rows]
+        slots = slots[: len(jobs)]
+        try:
+            staging = self._staging.narrow(len(jobs))
+            encoder_output = self._encode([job.log_mel for job in jobs])
+            self.model.set_encoder_output(staging, encoder_output)
+            languages = [job.language for job in jobs]
+            if None in languages:
+                detected = self._detect_languages(staging, len(jobs))
+                languages = [
+                    given or found for given, found in zip(languages, detected)
+                ]
 
-        languages = [job.language for job in jobs]
-        if None in languages:
-            detected = self._detect_languages(cache, batch_size)
-            languages = [given or found for given, found in zip(languages, detected)]
+            rows: dict[int, _Row] = {}
+            start = 0
+            while start < len(jobs):
+                layout = self._layout(jobs[start])
+                stop = start
+                while stop < len(jobs) and self._layout(jobs[stop]) == layout:
+                    stop += 1
+                rows.update(
+                    self._prefill(
+                        jobs[start:stop],
+                        languages[start:stop],
+                        staging.rows(start, stop),
+                        slots[start:stop],
+                        *layout,
+                    )
+                )
+                start = stop
+        except BaseException as exc:
+            for job in jobs:
+                job.future.set_exception(exc)
+            self._state.free(torch.tensor(slots, device=self.device))
+            return
+        self._rows.update(rows)
 
+    def _prefill(
+        self,
+        jobs: list[_Job],
+        languages: list[str],
+        staging: DecoderCache,
+        slots: list[int],
+        prefix_length: int,
+        limit: int,
+    ) -> dict[int, _Row]:
+        """Run one prompt pass for ``jobs`` (same prefix length) in ``staging``
+        and move them, with their first token, into rows ``slots`` of the pool."""
         prefixes = []
         for job, language in zip(jobs, languages):
             previous = [self.prev_id] + job.previous if job.previous else []
@@ -724,72 +828,122 @@ class Transcriber:
         sot_index = prefix_length - len(self._sot("en", jobs[0].task))
 
         hidden = self.model.decode(
-            tokens, self._positions[:prefix_length], cache, length=prefix_length
+            tokens, self._positions[:prefix_length], staging, length=prefix_length
         )
         logits = self.model.logits(hidden[:, [sot_index, prefix_length - 1]]).float()
         if self.no_speech_id is not None:
             no_speech_probs = logits[:, 0].softmax(dim=-1)[:, self.no_speech_id]
         else:
-            no_speech_probs = torch.zeros(batch_size, device=self.device)
+            no_speech_probs = torch.zeros(len(jobs), device=self.device)
+        token, logprob = self._choose(
+            logits[:, 1], self._first_suppress, self._temperatures(jobs)
+        )
 
-        temperatures = None
-        if any(job.temperature > 0 for job in jobs):
-            temperatures = torch.tensor(
-                [job.temperature for job in jobs], device=self.device
-            )
-        state.position.fill_(prefix_length - 1)
-        state.finished.zero_()
-        state.sum_logprobs.zero_()
-        self._select(logits[:, 1], state, self._first_suppress, temperatures)
-        steps = 1
+        # The first token sits at ``prefix_length``; a row may write up to ``end``.
+        end = prefix_length - 1 + limit
+        rows = torch.tensor(slots, device=self.device)
+        self._cache.copy_rows(staging, rows, prefix_length)
+        state = self._state
+        state.tokens[rows] = token[:, None]
+        state.position[rows] = prefix_length
+        state.end[rows] = end
+        state.finished[rows] = (token == self._eos) | (prefix_length >= end)
+        state.sum_logprobs[rows] = logprob
+        state.no_speech_probs[rows] = no_speech_probs
+        state.generated[rows, prefix_length] = token
+        # No transfer to the host here: it would wait for the GPU and leave it idle.
+        return {
+            slot: _Row(job, language, prefix_length, end, prefix_length)
+            for slot, job, language in zip(slots, jobs, languages)
+        }
 
+    def _temperatures(self, jobs: list[_Job | None]) -> Tensor | None:
+        """Per-row temperatures, or None when every row is greedy."""
+        values = [job.temperature if job is not None else 0.0 for job in jobs]
+        if not any(value > 0 for value in values):
+            return None
+        return torch.tensor(values, device=self.device)
+
+    @torch.inference_mode()
+    def _advance(self) -> None:
+        """Run up to ``EOS_CHECK_INTERVAL`` decoder steps over the occupied rows."""
+        # Rows past the highest occupied one are free (finished) padding.
+        bucket = next(size for size in self._buckets if size > max(self._rows))
+        rows = self._rows.values()
+        count = min(EOS_CHECK_INTERVAL, max(row.end - row.bound for row in rows))
+        count = max(count, 1)
+        length = max(min(row.bound + count, row.end) for row in rows) + 1
+        kv_bucket = next(size for size in self._kv_buckets if size >= length)
+        state = self._state.narrow(bucket)
+        temperatures = self._temperatures(
+            [
+                self._rows[slot].job if slot in self._rows else None
+                for slot in range(bucket)
+            ]
+        )
         if self.cuda_graphs and temperatures is None:
             # Graph steps advance the state on their own; the host only checks
-            # for EOS between groups of steps. Rows past ``batch_size`` are padding.
-            while steps < limit and not bool(state.finished.all()):
-                count = min(EOS_CHECK_INTERVAL, limit - steps)
-                length = prefix_length + steps + count - 1
-                kv_bucket = next(size for size in self._kv_buckets if size >= length)
-                graph = self._graphs[bucket, kv_bucket]
-                for _ in range(count):
-                    graph.replay()
-                steps += count
+            # for finished rows between groups of steps.
+            graph = self._graphs[bucket, kv_bucket]
+            for _ in range(count):
+                graph.replay()
         else:
-            while steps < limit and not bool(state.finished.all()):
-                self._step(state, cache, prefix_length + steps, temperatures)
-                steps += 1
+            cache = self._cache.narrow(bucket, kv_bucket)
+            for _ in range(count):
+                self._step(state, cache, temperatures)
+        for row in rows:
+            row.bound = min(row.bound + count, row.end)
 
-        results = []
-        end = prefix_length + steps
-        rows = state.generated[:, prefix_length:end].tolist()
-        for row, language, sum_logprob, no_speech_prob in zip(
-            rows, languages, state.sum_logprobs.tolist(), no_speech_probs.tolist()
+    @torch.inference_mode()
+    def _finish(self) -> None:
+        """Return the results of finished rows and free them."""
+        finished = self._state.finished[: max(self._rows) + 1].tolist()
+        done = [slot for slot in self._rows if finished[slot]]
+        if not done:
+            return
+        rows = torch.tensor(done, device=self.device)
+        positions = self._state.position[rows].tolist()
+        sums = self._state.sum_logprobs[rows].tolist()
+        no_speech_probs = self._state.no_speech_probs[rows].tolist()
+        generated = self._state.generated[rows, : max(positions) + 1].tolist()
+        self._state.free(rows)
+        for slot, position, sum_logprob, no_speech_prob, tokens in zip(
+            done, positions, sums, no_speech_probs, generated
         ):
-            if self._eos in row:
-                row = row[: row.index(self._eos)]
-            avg_logprob = sum_logprob / (len(row) + 1)
-            results.append(_Result(language, row, avg_logprob, no_speech_prob))
-        return results
+            row = self._rows.pop(slot)
+            tokens = tokens[row.prefix_length : position + 1]
+            if tokens and tokens[-1] == self._eos:
+                tokens.pop()
+            avg_logprob = sum_logprob / (len(tokens) + 1)
+            row.job.future.set_result(
+                _Result(row.language, tokens, avg_logprob, no_speech_prob)
+            )
 
     def _step(
         self,
         state: _DecodeState,
         cache: DecoderCache,
-        length: int | None = None,
         temperatures: Tensor | None = None,
     ) -> None:
         """Decode ``state.tokens`` and select the next token for every row."""
-        hidden = self.model.decode(state.tokens, state.position, cache, length)
+        hidden = self.model.decode(state.tokens, state.position, cache)
         logits = self.model.logits(hidden[:, -1]).float()
-        self._select(logits, state, self._suppress, temperatures)
+        token, logprob = self._choose(logits, self._suppress, temperatures)
+        # Finished and free rows keep their token and position.
+        active = ~state.finished
+        position = state.position + active
+        token = torch.where(active, token, state.tokens[:, 0])
+        state.sum_logprobs.add_(logprob.masked_fill(state.finished, 0.0))
+        state.generated.scatter_(1, position[:, None], token[:, None])
+        state.finished.logical_or_((token == self._eos) | (position >= state.end))
+        state.position.copy_(position)
+        state.tokens.copy_(token[:, None])
 
-    def _select(
-        self,
-        logits: Tensor,
-        state: _DecodeState,
-        suppress: Tensor,
-        temperatures: Tensor | None,
-    ) -> None:
+    def _choose(
+        self, logits: Tensor, suppress: Tensor, temperatures: Tensor | None
+    ) -> tuple[Tensor, Tensor]:
+        """Next token per row (greedy, or sampled where the temperature is
+        positive) and its log-probability."""
         logits.masked_fill_(suppress, -math.inf)
         token = logits.argmax(dim=-1)
         if temperatures is not None:
@@ -797,12 +951,7 @@ class Transcriber:
             sampled = torch.multinomial(F.softmax(scaled, dim=-1), 1).squeeze(1)
             token = torch.where(temperatures > 0, sampled, token)
         logprob = F.log_softmax(logits, dim=-1).gather(1, token[:, None]).squeeze(1)
-        # Rows that already ended keep decoding padding; ignore their scores.
-        state.sum_logprobs.add_(logprob.masked_fill(state.finished, 0.0))
-        state.finished.logical_or_(token == self._eos)
-        state.position.add_(1)
-        state.generated.index_copy_(1, state.position, token[:, None])
-        state.tokens.copy_(token[:, None])
+        return token, logprob
 
     def _detect_languages(self, cache: DecoderCache, batch_size: int) -> list[str]:
         if not self.multilingual:

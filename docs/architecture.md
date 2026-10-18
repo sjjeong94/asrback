@@ -235,72 +235,83 @@ flowchart TD
 - **Segments**: one `Segment` per window. `start` and `end` are the window bounds in seconds, and
   `compression_ratio` is the zlib compression ratio of the text.
 
-### 5.2 Worker: forming batches
+### 5.2 Worker: continuous batching
 
-`_serve()` splits the jobs returned by `gather_batch` by `_layout(job) = (prefix_length, limit)`.
-All rows of a batch start decoding at the same position, so they need the same prompt (previous text)
-length and the same token budget. Short audio without a prompt (most evaluation data) all lands in one
-group.
+The worker decodes in a pool of `max_batch_size` rows. A window takes a free row, decodes there until
+EOS or its token budget, and frees the row; other windows keep decoding meanwhile, so a batch never
+waits for its longest row, and windows with different prompt lengths decode together.
+
+```mermaid
+flowchart TD
+    A{"Pool empty and nothing pending?"} -- yes --> B["gather_batch: wait for windows"]
+    A -- no --> C
+    B --> C["Move already-queued windows to the pending list"]
+    C --> D{"Pending windows and free rows?"}
+    D -- yes --> E["_admit: encode them, run their prompts,<br/>move them into free rows"]
+    D -- no --> F
+    E --> F["_advance: up to 4 decoder steps over the occupied rows"]
+    F --> G["_finish: one transfer of the finished flags;<br/>return finished rows' results, free their rows"]
+    G --> A
+```
 
 - `prefix = [<|startofprev|>, ...previous]` (when there is previous text)
   `+ [<|startoftranscript|>, <|lang|>, <|task|>, <|notimestamps|>]`
 - English-only (`*.en`) models start with `[<|startoftranscript|>, <|notimestamps|>]`, without language
   or task tokens.
-- `limit = min(max_new_tokens or the remaining room, max_target_positions - prefix_length)`
+- `limit = min(max_new_tokens or the remaining room, max_target_positions - prefix_length)`; a row may
+  write up to position `end = prefix_length - 1 + limit`.
+- Free rows are marked finished at position 0, so steps leave them alone. Rows past the highest occupied
+  one are not computed: the step runs over the smallest batch bucket that covers it.
 
-### 5.3 Worker: `_decode_batch`
+### 5.3 Worker: admitting windows and decoder steps
 
 ```mermaid
 flowchart TD
-    A["Stack log-mels (B, n_mels, 3000)"] --> B["encoder → (B, 1500, d_model)<br/>(padded to a batch bucket with --compile-encoder)"]
-    B --> C["set_encoder_output: compute cross-attention K/V<br/>per layer once, into the cache"]
-    C --> D{"Rows without a language?"}
+    A["Sort new windows by (prefix_length, limit)"] --> B["encoder → (G, 1500, d_model)<br/>(padded to a batch bucket with --compile-encoder)"]
+    B --> C["set_encoder_output: cross-attention K/V per layer,<br/>into the staging cache"]
+    C --> D{"Windows without a language?"}
     D -- yes --> E["_detect_languages: one startoftranscript token,<br/>argmax over language tokens"]
     D -- no --> F
-    E --> F["One decoder pass over the prefix tokens (B, P), eager<br/>writes self-attention K/V to cache positions 0..P-1"]
-    F --> G["no_speech_prob = softmax(logits at SOT)[nospeech token]"]
-    G --> H["Select the first token (_select, with begin_suppress)"]
-    H --> I{"CUDA graphs on &<br/>temperature 0?"}
-    I -- yes --> J["graph.replay() 4 steps at a time<br/>pick a KV length bucket, check EOS in between"]
-    I -- no --> K["Repeat eager _step<br/>check EOS every step"]
-    J --> L["Cut generated tokens at EOS and build results"]
-    K --> L
+    E --> F["Per prefix length: one eager decoder pass over the prefix (g, P)<br/>in the staging cache"]
+    F --> G["no_speech_prob = softmax(logits at SOT)[nospeech token];<br/>first token (with begin_suppress)"]
+    G --> H["copy_rows: staging K/V → free rows of the pool;<br/>set each row's token, position, end and scores"]
 ```
 
-**The decoder cache** (`DecoderCache`) is four preallocated tensors shaped
-`(layers, batch, heads, length, head_dim)`. Self-attention keys and values are written in place at each
-step's position (`index_copy_`); cross-attention keys and values are filled once after the encoder.
-Because the tensors never move, the steps can be captured as CUDA graphs.
+**The decoder caches** (`DecoderCache`) are four preallocated tensors shaped
+`(layers, batch, heads, length, head_dim)`: the pool, and a staging cache of the same size where new
+windows run their prompt pass with rows side by side. The pool's tensors never move, so its steps can be
+captured as CUDA graphs. In a step, each row writes its self-attention key and value at its own position
+(`scatter_`) and attends to positions up to it (a `(batch, 1, 1, length)` mask).
 
-**The decoding state** (`_DecodeState`) holds, per row, the current token, the shared position, whether
-the row has finished, the sum of log-probabilities and a buffer of generated tokens. One step
-(`_step` → `_select`) does all of this on the GPU:
+**The decoding state** (`_DecodeState`) holds, per row, the current token, its position, the last
+position it may write, whether it has finished, the sum of log-probabilities, `no_speech_prob` and a
+buffer of generated tokens. One step (`_step` → `_choose`) does all of this on the GPU:
 
-1. Decode the current token at the current position to get logits for the next token.
-2. Apply the suppression mask (configured `suppress_tokens` and every timestamp token, plus
-   `begin_suppress_tokens` on the first step).
+1. Decode each row's current token at its position to get logits for the next token.
+2. Apply the suppression mask (configured `suppress_tokens` and every timestamp token).
 3. Pick the token by greedy argmax, or by sampling for rows with temperature > 0.
-4. Add the log-probability for rows that have not finished, and mark rows that produced EOS as finished.
-5. Advance the position, write the new token to `generated` and feed it back as the next input.
+4. For rows still decoding: add the log-probability, write the token to `generated` at the next position
+   and advance; mark rows that produced EOS or reached `end` as finished. Finished and free rows keep
+   their token and position.
 
-**CUDA graph path** (the default, when greedy):
+**CUDA graph path** (the default, when every occupied row is greedy):
 
-- A step reads and writes only fixed-address tensors, so one step is captured in advance for every
-  (batch bucket × KV length bucket) pair.
-  - Batch buckets: powers of two up to `max_batch_size` (1, 2, 4, 8, 16). A batch is padded up to the
-    nearest bucket; the extra rows are padding whose results are discarded.
-  - KV length buckets: 64, 128, 256 and 448 (`max_target_positions`). Inside a graph the whole cache
-    length is masked, so a shorter bucket reads less memory.
-- The host synchronizes on `finished.all()` only every `EOS_CHECK_INTERVAL` (4) steps. Rows that finish
-  in between keep decoding, but their scores and outputs ignore those steps.
-- A batch with any row at temperature > 0 takes the eager path.
+- One step is captured in advance for every (batch bucket × KV length bucket) pair.
+  - Batch buckets: powers of two up to `max_batch_size` (1, 2, 4, 8, 16).
+  - KV length buckets: 64, 128, 256 and 448 (`max_target_positions`). The host tracks an upper bound of
+    each row's position and picks the shortest bucket that covers the next 4 steps of every row.
+- The host synchronizes only in `_finish`, every `EOS_CHECK_INTERVAL` (4) steps. Admitting windows needs
+  no transfer: `no_speech_prob` stays on the GPU until the row finishes.
+- While any occupied row has temperature > 0, the steps run eagerly.
 
-**Eager path** (CPU, `--no-cuda-graphs`, sampling): calls the same `_step` directly, attending only to
-the filled part of the cache (no mask), and checks for EOS every step.
+**Eager path** (CPU, `--no-cuda-graphs`, sampling): calls the same `_step` directly.
 
-**Results**: `generated[:, prefix_length:prefix_length+steps]` is moved to the CPU in one transfer and
-each row is cut at its first EOS. `avg_logprob = sum of log-probabilities / (tokens + 1)`, counting EOS
-as openai-whisper does.
+**Results**: for the finished rows, `generated`, positions and scores are moved to the CPU in one
+transfer per tensor; a row's tokens run from `prefix_length` to its position, without the final EOS.
+`avg_logprob = sum of log-probabilities / (tokens + 1)`, counting EOS as openai-whisper does.
+
+**Errors**: if admitting fails, those windows fail and their rows are freed. If a step fails, every
+occupied row fails and the pool is reset; the worker keeps running.
 
 ### 5.4 Network
 
@@ -456,7 +467,7 @@ the results.
 | Unsupported language, format or temperature; empty file; word timestamps requested | `APIError` → 400 |
 | Task the model cannot do (translation) | `ValueError` from `transcribe()` → 400 |
 | Unknown model id | 404 |
-| Exception during batched inference | The same exception reaches every request of that batch (FastAPI answers 500); the worker keeps running |
+| Exception during batched inference | The same exception reaches every request of that batch (Whisper: of every occupied row) and FastAPI answers 500; the worker keeps running |
 | Model process exited (`--model-process`) | Pending and later requests raise `RuntimeError` (500) |
 
 ## 11. Defaults
@@ -470,6 +481,7 @@ the results.
 | CUDA graphs | on with CUDA (decoder steps) | none |
 | `--compile-encoder` | off (optional; batch buckets) | off (optional; per layer, dynamic shapes) |
 | Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once |
+| Batching | continuous: rows join and leave a pool of `max_batch_size` every 4 steps | batches of similar length |
 | Decoding | greedy or temperature sampling | greedy CTC |
 | Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 |
 | Eval concurrency | 128 requests from 4 processes | 128 requests from 4 processes |
