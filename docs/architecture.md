@@ -123,7 +123,7 @@ Endpoints (`server.py`):
 | `POST /v1/audio/transcriptions` | 400 if `timestamp_granularities[]` contains `word`, or if `language` is not supported. Then `run(..., task="transcribe")` |
 | `POST /v1/audio/translations` | `run(..., task="translate")`. Models that cannot translate (`*.en`, SenseVoice) raise `ValueError` in `transcribe()`, which becomes a 400 |
 | `GET /v1/models`, `GET /v1/models/{id}` | Lists the single loaded model (id from `--model-name` or the directory name). The request's `model` field is ignored |
-| `GET /health` | `{"status": "ok"}` |
+| `GET /health` | `{"status": "ok"}`, or 503 when the model process has exited (`--model-process`) |
 
 The shared handler `run()`:
 
@@ -200,7 +200,8 @@ flowchart LR
 - Exceptions from `transcribe()` (for example the `ValueError` of an unsupported task) are sent back and
   raised by the caller, so they become 400s as before.
 - The model process ignores SIGINT and is a daemon: it stops with the server process, and it exits when
-  the pipe closes. If it dies, pending and later requests fail with `RuntimeError` (500).
+  the pipe closes. If it dies, pending and later requests fail with `RuntimeError` (500) and `/health`
+  answers 503, so a supervisor can restart the server.
 - Measured with a lightweight multi-process client on LibriSpeech test-clean (RTX 5060 Ti): SenseVoice
   11.1–11.5 s → 9.4–9.5 s (GPU busy 64% → 77%); whisper-small 60.8 s → 59.3 s (already GPU-bound).
 
@@ -391,8 +392,8 @@ Segments are 30-second windows; there are no word-level timestamps.
 
 ## 8. Evaluation tool (asrback-eval)
 
-Implementation: `evaluation.py`. It sends requests to a running server through the OpenAI client and
-measures error rates.
+Implementation: `evaluation.py`. It sends requests to a running server through the OpenAI client from
+several client processes and measures error rates in the main process.
 
 ```mermaid
 flowchart TD
@@ -406,8 +407,8 @@ flowchart TD
     F --> G["--resume: skip utterances already in --output"]
     G --> H["--sort-by-length: largest files first"]
     H --> I["Check /v1/models on each server (round-robin over several --base-url)"]
-    I --> J["ThreadPoolExecutor(--concurrency, default 128)<br/>verbose_json requests"]
-    J --> K["As they complete: normalize → split words/characters → add edit distance"]
+    I --> J["--processes client processes (default 4), --concurrency threads in all (default 128)<br/>take files from a job queue, send verbose_json requests"]
+    J --> K["Main process, as results arrive: normalize → split words/characters → add edit distance"]
     K --> L["Write one row per utterance to the --output JSONL"]
     L --> M["Print WER/CER, errors, audio length, elapsed time, RTFx"]
 ```
@@ -419,6 +420,11 @@ flowchart TD
 - **Resume**: `--resume` rewrites the rows of the earlier output file and includes them in the score; a
   file scored with a different metric is refused.
 - **Timing**: `RTFx = total audio duration / elapsed time`, excluding utterances skipped by `--resume`.
+  The clock starts once every client process has imported the OpenAI client and is ready.
+- **Client processes**: the OpenAI client spends enough CPU per request that one process (with the GIL)
+  could not keep up with the SenseVoice server: on LibriSpeech test-clean, 1 process took 13.5 s and
+  2–8 processes 10.5–10.8 s. A failed request stops the run with exit code 1, and Ctrl-C stops the
+  client processes and exits with 130.
 - **Concurrency**: keep `--concurrency` well above the server's `max_batch_size` so batches fill and
   SenseVoice can group windows of similar length.
 
@@ -459,4 +465,4 @@ the results.
 | Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once |
 | Decoding | greedy or temperature sampling | greedy CTC |
 | Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 |
-| Eval concurrency | 128 | 128 |
+| Eval concurrency | 128 requests from 4 processes | 128 requests from 4 processes |

@@ -94,7 +94,8 @@ For speed, keep `--concurrency` (default 128) well above the server's
 `--max-batch-size` and pass `--sort-by-length` so similar-length files share a batch.
 The SenseVoice server also groups queued windows of similar length itself, which
 helps more the more requests are in flight. `--base-url` can be repeated to spread
-requests over several servers.
+requests over several servers. Requests are sent from `--processes` client processes
+(default 4), since one process running the OpenAI client can be slower than the server.
 
 ```bash
 uv run asrback-eval --base-url http://127.0.0.1:8000/v1 --sort-by-length

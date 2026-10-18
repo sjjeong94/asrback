@@ -70,6 +70,11 @@ class ProcessTranscriber:
             target=self._receive, name="asrback-model-results", daemon=True
         ).start()
 
+    @property
+    def alive(self) -> bool:
+        """Whether the model process is still running and serving requests."""
+        return not self._closed and self._process.is_alive()
+
     def transcribe(self, audio: AudioSource, **options) -> Transcription:
         future: Future = Future()
         with self._send_lock:

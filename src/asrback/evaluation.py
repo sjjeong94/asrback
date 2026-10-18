@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
+import queue
 import re
+import signal
 import sys
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -76,6 +79,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "size. Default: 128",
     )
     parser.add_argument(
+        "--processes",
+        type=int,
+        default=4,
+        help="Client processes sending the requests. The OpenAI client costs enough "
+        "CPU per request that one process can be slower than the server. Default: 4",
+    )
+    parser.add_argument(
         "--sort-by-length",
         action="store_true",
         help="Send the longest files first so concurrent requests batch well.",
@@ -100,6 +110,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--limit must be greater than zero")
     if args.concurrency <= 0:
         parser.error("--concurrency must be greater than zero")
+    if args.processes <= 0:
+        parser.error("--processes must be greater than zero")
     return args
 
 
@@ -238,6 +250,46 @@ def edit_distance(reference: list[str], hypothesis: list[str]) -> int:
     return previous[-1]
 
 
+def send_requests(
+    base_urls: list[str],
+    api_key: str,
+    options: dict,
+    first_thread: int,
+    threads: int,
+    jobs: multiprocessing.Queue,
+    results: multiprocessing.Queue,
+) -> None:
+    """Client process: transcribe ``(index, path)`` items from ``jobs`` on
+    ``threads`` threads until each reads a ``None``, and put
+    ``(index, text, duration, error)`` on ``results``, after a ``None`` once
+    the clients are ready."""
+    # Ctrl-C reaches the whole process group; the main process stops us.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import openai
+
+    clients = [
+        openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        for base_url in base_urls
+    ]
+    results.put(None)
+
+    def work(thread: int) -> None:
+        # Threads alternate between servers, counted across all processes.
+        client = clients[thread % len(clients)]
+        while (item := jobs.get()) is not None:
+            index, path = item
+            try:
+                with open(path, "rb") as file:
+                    result = client.audio.transcriptions.create(file=file, **options)
+                results.put((index, result.text.strip(), float(result.duration), None))
+            except Exception as exc:
+                results.put((index, "", 0.0, str(exc)))
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        for thread in range(first_thread, first_thread + threads):
+            executor.submit(work, thread)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -305,11 +357,6 @@ def main(argv: list[str] | None = None) -> int:
     if language:
         options["language"] = language
 
-    def transcribe(sample: Sample, client: openai.OpenAI) -> tuple[str, float]:
-        with sample.audio_path.open("rb") as file:
-            result = client.audio.transcriptions.create(file=file, **options)
-        return result.text.strip(), float(result.duration)
-
     output_file = None
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -325,19 +372,52 @@ def main(argv: list[str] | None = None) -> int:
         for row in previous.values()
     )
     audio_seconds = 0.0
-    started = time.perf_counter()
-    executor = ThreadPoolExecutor(max_workers=args.concurrency)
-    try:
-        futures = {
-            executor.submit(transcribe, sample, clients[index % len(clients)]): sample
-            for index, sample in enumerate(samples)
-        }
-        for done, future in enumerate(as_completed(futures), start=len(previous) + 1):
-            sample = futures[future]
+    # Requests go out from several processes; this one only scores the results.
+    context = multiprocessing.get_context("spawn")
+    jobs, results = context.Queue(), context.Queue()
+    concurrency = min(args.concurrency, max(len(samples), 1))
+    process_count = min(args.processes, concurrency)
+    processes = []
+    for rank in range(process_count):
+        first = rank * concurrency // process_count
+        threads = (rank + 1) * concurrency // process_count - first
+        processes.append(
+            context.Process(
+                target=send_requests,
+                args=(args.base_url, api_key, options, first, threads, jobs, results),
+                daemon=True,
+            )
+        )
+    for process in processes:
+        process.start()
+
+    def next_result() -> tuple[int, str, float, str | None] | None:
+        while True:
             try:
-                hypothesis, duration = future.result()
-            except openai.APIError as exc:
-                raise SystemExit(f"{sample.utterance_id}: {exc}") from exc
+                return results.get(timeout=1)
+            except queue.Empty:
+                # Processes exit once their threads run out of jobs; a failure
+                # shows as an exit code, or as results missing after all exited.
+                if any(process.exitcode for process in processes) or not any(
+                    process.is_alive() for process in processes
+                ):
+                    raise SystemExit("A client process exited unexpectedly.") from None
+
+    try:
+        # Each process reports None once its clients are ready; time from there.
+        for _ in processes:
+            next_result()
+        started = time.perf_counter()
+        for index, sample in enumerate(samples):
+            jobs.put((index, str(sample.audio_path)))
+        for _ in range(concurrency):
+            jobs.put(None)
+
+        for done in range(len(previous) + 1, total + 1):
+            index, hypothesis, duration, error = next_result()
+            sample = samples[index]
+            if error is not None:
+                raise SystemExit(f"{sample.utterance_id}: {error}")
 
             normalized_reference = normalize(sample.reference)
             normalized_hypothesis = normalize(hypothesis)
@@ -372,8 +452,12 @@ def main(argv: list[str] | None = None) -> int:
         print("\nInterrupted.")
         return 130
     finally:
-        # Drop queued requests instead of waiting for them on error or Ctrl-C.
-        executor.shutdown(wait=False, cancel_futures=True)
+        # Stop requests still in flight on error or Ctrl-C; done otherwise.
+        for process in processes:
+            process.terminate()
+        for process in processes:
+            process.join()
+        jobs.cancel_join_thread()
         if output_file is not None:
             output_file.close()
 

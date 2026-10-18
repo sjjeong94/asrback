@@ -204,7 +204,12 @@ def create_app(
         return model_card()
 
     @app.get("/health")
-    def health() -> dict:
-        return {"status": "ok"}
+    def health() -> Response:
+        if isinstance(transcriber, ProcessTranscriber) and not transcriber.alive:
+            return JSONResponse(
+                {"status": "error", "detail": "the model process has exited"},
+                status_code=503,
+            )
+        return JSONResponse({"status": "ok"})
 
     return app
