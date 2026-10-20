@@ -32,6 +32,7 @@ from ..transcription import (
     Transcription,
     compression_ratio,
     gather_batch,
+    to_device,
 )
 
 SAMPLE_RATE = asrfront.sensevoice.SAMPLE_RATE
@@ -262,6 +263,19 @@ class _Job:
 
 
 @dataclass
+class _Batch:
+    """A batch whose forward pass is queued on the device; its outputs arrive in
+    host memory once ``done`` (a CUDA event, or None on the CPU) completes."""
+
+    jobs: list[_Job]
+    lengths: list[int]
+    best: Tensor
+    avg_logprobs: Tensor
+    no_speech: Tensor
+    done: torch.cuda.Event | None
+
+
+@dataclass
 class _Result:
     language: str
     tokens: list[int]
@@ -451,8 +465,11 @@ class SenseVoiceTranscriber:
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
         pending: list[_Job] = []
+        # The batch running on the device: the next one is queued before reading its
+        # results, so the device never waits for the host to pad and parse.
+        running: _Batch | None = None
         while True:
-            if not pending:
+            if not pending and running is None:
                 pending = gather_batch(
                     self._queue, self.max_batch_size, self.batch_wait
                 )
@@ -462,15 +479,24 @@ class SenseVoiceTranscriber:
                     pending.append(self._queue.get_nowait())
                 except queue.Empty:
                     break
-            jobs = take_similar(pending, self.max_batch_size)
-            try:
-                results = self._decode_batch(jobs)
-            except BaseException as exc:
-                for job in jobs:
-                    job.future.set_exception(exc)
-                continue
-            for job, result in zip(jobs, results):
-                job.future.set_result(result)
+            launched = None
+            if pending:
+                jobs = take_similar(pending, self.max_batch_size)
+                try:
+                    launched = self._launch(jobs)
+                except BaseException as exc:
+                    for job in jobs:
+                        job.future.set_exception(exc)
+            if running is not None:
+                try:
+                    results = self._collect(running)
+                except BaseException as exc:
+                    for job in running.jobs:
+                        job.future.set_exception(exc)
+                else:
+                    for job, result in zip(running.jobs, results):
+                        job.future.set_result(result)
+            running = launched
 
     @torch.inference_mode()
     def _compile_encoder(self) -> None:
@@ -519,7 +545,9 @@ class SenseVoiceTranscriber:
         return best, avg_logprobs, no_speech
 
     @torch.inference_mode()
-    def _decode_batch(self, jobs: list[_Job]) -> list[_Result]:
+    def _launch(self, jobs: list[_Job]) -> _Batch:
+        """Queue the forward pass of ``jobs`` and the copy of its outputs to the
+        host, without waiting for either."""
         batch_size = len(jobs)
         lengths = [len(job.features) for job in jobs]
         longest = max(lengths)
@@ -527,8 +555,7 @@ class SenseVoiceTranscriber:
         features = np.zeros((batch_size, longest, width), dtype=np.float32)
         for row, job in enumerate(jobs):
             features[row, : len(job.features)] = job.features
-        features = torch.from_numpy(features)
-        queries = torch.tensor(
+        queries = np.array(
             [
                 [
                     LANGUAGE_QUERIES[job.language or "auto"],
@@ -539,18 +566,36 @@ class SenseVoiceTranscriber:
                 for job in jobs
             ]
         )
-        best, avg_logprobs, no_speech = self._forward(
-            features.to(self.device, self.dtype),
-            queries.to(self.device),
-            torch.tensor(lengths, device=self.device),
+        # Copied from pinned memory: a copy from pageable memory would wait for the
+        # batch running before this one.
+        outputs = self._forward(
+            to_device(features, self.device).to(self.dtype),
+            to_device(queries, self.device),
+            to_device(lengths, self.device),
             masked=min(lengths) != longest,
         )
-        rows = best.tolist()
-        avg_logprobs = avg_logprobs.tolist()
-        no_speech = no_speech.tolist()
+        if self.device.type != "cuda":
+            return _Batch(jobs, lengths, *outputs, None)
+        best, avg_logprobs, no_speech = (
+            torch.empty(output.shape, dtype=output.dtype, pin_memory=True).copy_(
+                output, non_blocking=True
+            )
+            for output in outputs
+        )
+        done = torch.cuda.Event()
+        done.record()
+        return _Batch(jobs, lengths, best, avg_logprobs, no_speech, done)
+
+    def _collect(self, batch: _Batch) -> list[_Result]:
+        """Wait for ``batch`` and turn its outputs into results."""
+        if batch.done is not None:
+            batch.done.synchronize()
+        rows = batch.best.tolist()
+        avg_logprobs = batch.avg_logprobs.tolist()
+        no_speech = batch.no_speech.tolist()
 
         results = []
-        for row, length, job in zip(range(len(jobs)), lengths, jobs):
+        for row, length, job in zip(range(len(batch.jobs)), batch.lengths, batch.jobs):
             frames = rows[row][: QUERY_COUNT + length]
             # Greedy CTC: merge repeats, then drop blanks.
             tokens = [

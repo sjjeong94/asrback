@@ -17,6 +17,7 @@ import re
 import threading
 from collections import deque
 from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from tokenizers import Tokenizer
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ..transcription import (
     DTYPES,
@@ -36,6 +38,7 @@ from ..transcription import (
     Transcription,
     compression_ratio,
     gather_batch,
+    to_device,
 )
 
 SAMPLE_RATE = asrfront.whisper.SAMPLE_RATE
@@ -46,6 +49,15 @@ MIN_TAIL_SAMPLES = SAMPLE_RATE // 10
 EOS_CHECK_INTERVAL = 4
 # Self-attention lengths with their own CUDA graph, besides max_target_positions.
 KV_BUCKETS = (64, 128, 256)
+# Attention backends for a fixed-shape decoder step, in order of preference. cuDNN
+# reads the cross-attention keys about 20% faster than flash attention for one
+# query per row; it plans each new shape (tens of ms), and the step has few shapes.
+STEP_ATTENTION = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 REQUIRED_FILES = (
     "model.safetensors",
@@ -124,7 +136,9 @@ class WhisperEncoder(nn.Module):
 
     def forward(self, mel: Tensor) -> Tensor:
         x = F.gelu(self.conv1(mel))
-        x = F.gelu(self.conv2(x)).transpose(1, 2)
+        # Contiguous once here: left transposed, every layer norm copies its input
+        # and every residual add takes a slower strided kernel.
+        x = F.gelu(self.conv2(x)).transpose(1, 2).contiguous()
         if x.shape[1] != self.embed_positions.num_embeddings:
             raise ValueError(
                 f"expected {self.embed_positions.num_embeddings * 2} mel frames, "
@@ -247,14 +261,16 @@ class WhisperDecoder(nn.Module):
             mask = (key_positions[None, :] <= positions[:, None])[:, None, None, :]
         else:
             x = self.embed_tokens(tokens) + self.embed_positions(positions)
-        for index, layer in enumerate(self.layers):
-            layer_cache = (
-                cache.self_keys[index],
-                cache.self_values[index],
-                cache.cross_keys[index],
-                cache.cross_values[index],
-            )
-            x = layer(x, layer_cache, positions, length, mask)
+        step = length is None
+        with sdpa_kernel(STEP_ATTENTION, set_priority=True) if step else nullcontext():
+            for index, layer in enumerate(self.layers):
+                layer_cache = (
+                    cache.self_keys[index],
+                    cache.self_values[index],
+                    cache.cross_keys[index],
+                    cache.cross_values[index],
+                )
+                x = layer(x, layer_cache, positions, length, mask)
         return self.layer_norm(x)
 
 
@@ -316,7 +332,11 @@ class WhisperForConditionalGeneration(nn.Module):
         return self.model.decoder(tokens, positions, cache, length)
 
     def logits(self, hidden: Tensor) -> Tensor:
-        return F.linear(hidden, self.model.decoder.embed_tokens.weight)
+        # As weight @ hidden.T: for F.linear(hidden, weight) with 8-16 rows, cuBLAS
+        # picks a kernel up to 3x slower at some widths (384, 768).
+        weight = self.model.decoder.embed_tokens.weight
+        rows = hidden.flatten(0, -2)
+        return (weight @ rows.T).T.unflatten(0, hidden.shape[:-1])
 
 
 def load_json(path: Path) -> dict:
@@ -671,7 +691,7 @@ class Transcriber:
             self._encoder(mel)
 
     def _encode(self, log_mels: list[np.ndarray]) -> Tensor:
-        mel = torch.from_numpy(np.stack(log_mels)).to(self.device, self.dtype)
+        mel = to_device(np.stack(log_mels), self.device).to(self.dtype)
         if not self.compile_encoder:
             return self._encoder(mel)
         batch_size = len(log_mels)
@@ -804,13 +824,17 @@ class Transcriber:
         for job, language in zip(jobs, languages):
             previous = [self.prev_id] + job.previous if job.previous else []
             prefixes.append(previous + self._sot(language, job.task))
-        tokens = torch.tensor(prefixes, device=self.device)
+        # Copied from pinned memory: a copy from pageable memory (or a transfer to the
+        # host) would wait for the decoder steps queued before it.
+        tokens = to_device(prefixes, self.device)
         sot_index = prefix_length - len(self._sot("en", jobs[0].task))
 
         hidden = self.model.decode(
             tokens, self._positions[:prefix_length], staging, length=prefix_length
         )
-        logits = self.model.logits(hidden[:, [sot_index, prefix_length - 1]]).float()
+        logits = self.model.logits(
+            torch.stack((hidden[:, sot_index], hidden[:, -1]), dim=1)
+        ).float()
         if self.no_speech_id is not None:
             no_speech_probs = logits[:, 0].softmax(dim=-1)[:, self.no_speech_id]
         else:
@@ -821,7 +845,7 @@ class Transcriber:
 
         # The first token sits at ``prefix_length``; a row may write up to ``end``.
         end = prefix_length - 1 + limit
-        rows = torch.tensor(slots, device=self.device)
+        rows = to_device(slots, self.device)
         self._cache.copy_rows(staging, rows, prefix_length)
         state = self._state
         state.tokens[rows] = token[:, None]
@@ -842,7 +866,7 @@ class Transcriber:
         values = [job.temperature if job is not None else 0.0 for job in jobs]
         if not any(value > 0 for value in values):
             return None
-        return torch.tensor(values, device=self.device)
+        return to_device(values, self.device)
 
     @torch.inference_mode()
     def _advance(self) -> None:
