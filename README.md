@@ -1,8 +1,9 @@
 # asrback
 
 OpenAI-compatible speech-to-text server for Whisper checkpoints in Hugging Face
-SafeTensors format, FunASR's SenseVoiceSmall and Qwen3-ASR (0.6B, 1.7B), implemented in
-plain PyTorch (no `transformers`, `openai-whisper`, `funasr` or `qwen-asr` at runtime).
+SafeTensors format, FunASR's SenseVoiceSmall, Qwen3-ASR (0.6B, 1.7B) and Gemma 4 (E2B,
+E4B), implemented in plain PyTorch (no `transformers`, `openai-whisper`, `funasr` or
+`qwen-asr` at runtime).
 
 ## Setup
 
@@ -11,6 +12,7 @@ uv sync
 scripts/download_whisper_hf.sh tiny   # -> models/whisper-tiny (tiny, base, small, *.en, large-v3-turbo)
 scripts/download_sensevoice_hf.sh     # -> models/sensevoice-small
 scripts/download_qwen3_asr_hf.sh      # -> models/qwen3-asr-{0.6b,1.7b} (or pass 0.6B / 1.7B)
+scripts/download_gemma4_hf.sh         # -> models/gemma-4-{e2b,e4b}-it (or pass E2B / E4B)
 ```
 
 ## Server
@@ -19,6 +21,7 @@ scripts/download_qwen3_asr_hf.sh      # -> models/qwen3-asr-{0.6b,1.7b} (or pass
 uv run asrback --model-dir models/whisper-tiny --port 8000
 uv run asrback --model-dir models/sensevoice-small --port 8000
 uv run asrback --model-dir models/qwen3-asr-0.6b --port 8000
+uv run asrback --model-dir models/gemma-4-e2b-it --port 8000
 ```
 
 The model type is detected from the directory. SenseVoice transcribes Chinese,
@@ -32,6 +35,14 @@ Qwen3-ASR transcribes 30 languages (`zh`, `en`, `yue`, `ar`, `de`, `fr`, `es`, `
 it names the language it hears in each window; with one, the prompt names it. `prompt`
 becomes the system message, so it can carry context such as names and terms. It does
 not translate. Windows of a long file are decoded independently and together.
+
+Gemma 4 E2B and E4B transcribe with the model card's ASR prompt, which names the request
+`language` (an ISO code such as `en`, `ko`, `ja`) or, without one, asks for the original
+language; the response reports the request's language, or `unknown`. `prompt` becomes the
+system message. It does not translate. The vision tower is not loaded, and the per-layer
+embedding table (4.7 GB for E2B, 5.6 GB for E4B) stays in host memory, so E4B fits on a
+16 GB GPU (about 15.8 GB in use at the default batch size of 32; use a smaller
+`--max-batch-size` if it runs out of memory).
 
 Endpoints:
 
@@ -48,9 +59,9 @@ Concurrent requests are decoded together in batches. Options that affect speed:
 | Option | Default | |
 | --- | --- | --- |
 | `--dtype` | `bfloat16` on CUDA, else `float32` | Model precision (`float32`, `bfloat16`) |
-| `--max-batch-size` | `16` (SenseVoice: `32`, Qwen3-ASR: `64`, `32` in float32) | Most requests decoded together |
+| `--max-batch-size` | `16` (SenseVoice: `32`, Qwen3-ASR: `64`, `32` in float32; Gemma 4: `32`, `16` in float32) | Most requests decoded together |
 | `--batch-wait-ms` | `5` | How long a batch waits to fill |
-| `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper, Qwen3-ASR: replay each decoder step from a captured CUDA graph |
+| `--cuda-graphs` / `--no-cuda-graphs` | on for CUDA | Whisper, Qwen3-ASR, Gemma 4: replay each decoder step from a captured CUDA graph |
 | `--model-process` / `--no-model-process` | on | Run the model in a child process so HTTP handling does not hold up decoding |
 | `--compile-encoder` | off | Whisper, SenseVoice: `torch.compile` the encoder; slower startup, faster for larger models |
 | `--condition-on-previous-text` / `--no-condition-on-previous-text` | on | Whisper: condition each 30 s window on the text before it; turned off, the windows of a long file are decoded together |
@@ -93,6 +104,19 @@ The request language comes from the dataset (`en` for LibriSpeech, `ko` for
 server detect it. Japanese, Korean and other languages in which word boundaries are
 missing or too coarse are scored by character error rate (spaces ignored), and the
 rest by word error rate. `--metric wer|cer` overrides this.
+
+Gemma 4 E2B and E4B (bfloat16, greedy, RTX 5060 Ti 16 GB, default options):
+
+| Model | LibriSpeech test-clean WER | FLEURS en_us WER | FLEURS ko_kr CER | FLEURS ja_jp CER |
+| --- | --- | --- | --- | --- |
+| Gemma 4 E2B | 3.64% (RTFx 94) | 8.82% | 5.30% | 10.26% |
+| Gemma 4 E4B | 3.05% (RTFx 59) | 7.05% | 3.70% | 7.57% |
+
+```bash
+scripts/download_gemma4_hf.sh E2B
+uv run asrback --model-dir models/gemma-4-e2b-it --port 8000
+uv run asrback-eval --base-url http://127.0.0.1:8000/v1 --dataset data/fleurs/ko_kr
+```
 
 Use `--limit N` for a quick run and `--output predictions.jsonl` to save per-utterance
 results; add `--resume` to skip utterances already in that file. Text is normalized

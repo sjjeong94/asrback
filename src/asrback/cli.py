@@ -1,5 +1,5 @@
-"""``asrback`` command: serve a Whisper, SenseVoice or Qwen3-ASR checkpoint over the
-OpenAI audio API."""
+"""``asrback`` command: serve a Whisper, SenseVoice, Qwen3-ASR or Gemma 4 checkpoint
+over the OpenAI audio API."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="asrback",
-        description="Serve a Whisper, SenseVoice or Qwen3-ASR model through "
+        description="Serve a Whisper, SenseVoice, Qwen3-ASR or Gemma 4 model through "
         "OpenAI-compatible /v1/audio endpoints.",
     )
     parser.add_argument(
@@ -19,7 +19,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("models/whisper-tiny"),
         help="Whisper directory (model.safetensors and tokenizer/config JSON files), "
         "SenseVoice directory (model.pt, config.yaml, am.mvn, BPE model) or "
-        "Qwen3-ASR directory (safetensors, config JSON files, vocab.json, merges.txt).",
+        "Qwen3-ASR directory (safetensors, config JSON files, vocab.json, merges.txt) "
+        "or Gemma 4 directory (model.safetensors, config JSON files, tokenizer.json).",
     )
     parser.add_argument(
         "--model-name",
@@ -43,7 +44,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Most concurrent requests decoded together. "
         "Default: 16 for Whisper, 32 for SenseVoice, 64 for Qwen3-ASR "
-        "(32 in float32)",
+        "(32 in float32), 32 for Gemma 4 (16 in float32)",
     )
     parser.add_argument(
         "--batch-wait-ms",
@@ -55,7 +56,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cuda-graphs",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Replay decoder steps from captured CUDA graphs (Whisper, Qwen3-ASR). "
+        help="Replay decoder steps from captured CUDA graphs (Whisper, Qwen3-ASR, "
+        "Gemma 4). "
         "Default: on for CUDA",
     )
     parser.add_argument(

@@ -11,27 +11,29 @@ interactive client (`asrback-client`).
 - [5. Whisper inference](#5-whisper-inference)
 - [6. SenseVoice inference](#6-sensevoice-inference)
 - [7. Qwen3-ASR inference](#7-qwen3-asr-inference)
-- [8. Responses](#8-responses)
-- [9. Evaluation tool (asrback-eval)](#9-evaluation-tool-asrback-eval)
-- [10. Interactive client (asrback-client)](#10-interactive-client-asrback-client)
-- [11. Error handling](#11-error-handling)
-- [12. Defaults](#12-defaults)
+- [8. Gemma 4 inference](#8-gemma-4-inference)
+- [9. Responses](#9-responses)
+- [10. Evaluation tool (asrback-eval)](#10-evaluation-tool-asrback-eval)
+- [11. Interactive client (asrback-client)](#11-interactive-client-asrback-client)
+- [12. Error handling](#12-error-handling)
+- [13. Defaults](#13-defaults)
 
 ## 1. Package layout
 
 ```
 src/asrback/
-├── __init__.py          # Public API: Transcriber, SenseVoiceTranscriber, Qwen3ASRTranscriber, ...
+├── __init__.py          # Public API: Transcriber, SenseVoiceTranscriber, Qwen3ASRTranscriber, Gemma4Transcriber, ...
 ├── __main__.py          # python -m asrback → cli.main
 ├── cli.py               # asrback: parse arguments, load the model, run uvicorn
 ├── server.py            # FastAPI app: /v1/audio/*, /v1/models, /health
 ├── model_process.py     # ProcessTranscriber: the transcriber in a child process (--model-process)
 ├── transcription.py     # Shared types and helpers: Segment, Transcription, gather_batch, CapturedGraph, ...
 ├── models/
-│   ├── __init__.py      # load_transcriber: pick Whisper, SenseVoice or Qwen3-ASR from the model directory
+│   ├── __init__.py      # load_transcriber: pick Whisper, SenseVoice, Qwen3-ASR or Gemma 4 from the model directory
 │   ├── whisper.py       # Whisper network + Transcriber (batched decoding, CUDA graphs)
 │   ├── sensevoice.py    # SenseVoiceSmall network + SenseVoiceTranscriber (CTC)
-│   └── qwen3_asr.py     # Qwen3-ASR network + Qwen3ASRTranscriber (batched decoding, CUDA graphs)
+│   ├── qwen3_asr.py     # Qwen3-ASR network + Qwen3ASRTranscriber (batched decoding, CUDA graphs)
+│   └── gemma4.py        # Gemma 4 E2B/E4B audio encoder and language model + Gemma4Transcriber
 ├── evaluation.py        # asrback-eval: WER / CER on LibriSpeech or FLEURS
 └── client.py            # asrback-client: interactive transcription client
 scripts/                 # Model and dataset download scripts
@@ -41,9 +43,9 @@ What each external dependency is used for:
 
 | Dependency | Used by | Purpose |
 | --- | --- | --- |
-| `asrfront` | all models | Audio decoding (`asrfront.load`), Whisper log-mel, SenseVoice fbank + LFR + CMVN, Qwen3-ASR log-mel and audio token counts |
+| `asrfront` | all models | Audio decoding (`asrfront.load`), Whisper log-mel, SenseVoice fbank + LFR + CMVN, Qwen3-ASR and Gemma 4 log-mel and audio token counts |
 | `torch` | all models | Network computation, CUDA graphs, flash attention for packed sequences (`varlen_attn`) |
-| `safetensors`, `tokenizers` | Whisper, Qwen3-ASR | Weights (`model.safetensors`, or shards) and tokenizer (`tokenizer.json`; for Qwen3-ASR, byte-level BPE built from `vocab.json` and `merges.txt`) |
+| `safetensors`, `tokenizers` | Whisper, Qwen3-ASR, Gemma 4 | Weights (`model.safetensors`, or shards) and tokenizer (`tokenizer.json`; for Qwen3-ASR, byte-level BPE built from `vocab.json` and `merges.txt`) |
 | `sentencepiece`, `pyyaml` | SenseVoice | BPE tokenizer, `config.yaml` |
 | `fastapi`, `uvicorn[standard]`, `python-multipart` | server | HTTP and multipart upload parsing (with uvloop and httptools) |
 | `openai` | eval, client | Calls to the OpenAI-compatible API |
@@ -64,16 +66,20 @@ flowchart TD
     E -- yes --> F["SenseVoiceTranscriber(...)"]
     E -- no --> Q{"is_qwen3_asr(DIR)?<br/>model_type in config.json is qwen3_asr"}
     Q -- yes --> QT["Qwen3ASRTranscriber(...)"]
-    Q -- no --> G["Transcriber(...) (Whisper)"]
+    Q -- no --> GM{"is_gemma4(DIR)?<br/>model_type in config.json is gemma4"}
+    GM -- yes --> GT["Gemma4Transcriber(...)"]
+    GM -- no --> G["Transcriber(...) (Whisper)"]
     F --> H["create_app(transcriber, model_name)"]
     QT --> H
+    GT --> H
     G --> H
     H --> I["uvicorn.run(app)"]
     I --> J["lifespan: raise the AnyIO thread limit<br/>to max(40, 8 × max_batch_size)"]
 ```
 
 1. **Argument parsing** (`cli.parse_args`): `--max-batch-size` defaults to `None`, which means the
-   model's own default (16 for Whisper, 32 for SenseVoice, 64 for Qwen3-ASR or 32 in float32).
+   model's own default (16 for Whisper, 32 for SenseVoice, 64 for Qwen3-ASR or 32 in float32,
+   32 for Gemma 4 or 16 in float32).
 2. **Model process** (`model_process.ProcessTranscriber`, on by default): the steps below run in a
    child process started with `spawn`. The server process keeps only a proxy with the same interface
    (`transcribe`, `languages`, `max_batch_size`, ...); errors while loading are sent back and raised
@@ -81,9 +87,9 @@ flowchart TD
    in the server process.
 3. **Model selection** (`models.load_transcriber`): options left as `None` are dropped. If the
    `model` value in `config.yaml` starts with `SenseVoice`, the directory is a SenseVoice checkpoint;
-   if `model_type` in `config.json` is `qwen3_asr`, a Qwen3-ASR checkpoint; otherwise it is treated as
-   Whisper. Passing `--cuda-graphs` or `--condition-on-previous-text` with SenseVoice, or
-   `--compile-encoder` or `--condition-on-previous-text` with Qwen3-ASR, raises `ValueError`, which the
+   if `model_type` in `config.json` is `qwen3_asr`, a Qwen3-ASR checkpoint; if it is `gemma4`, a Gemma 4
+   checkpoint; otherwise it is treated as Whisper. Passing `--cuda-graphs` or `--condition-on-previous-text` with SenseVoice, or
+   `--compile-encoder` or `--condition-on-previous-text` with Qwen3-ASR or Gemma 4, raises `ValueError`, which the
    CLI turns into an exit with the message (`SystemExit`).
 4. **Transcriber construction**: the weights are loaded and moved to the device and dtype, the
    model-specific preparation below runs, and **one decoding worker thread is started.** Only that
@@ -103,6 +109,9 @@ flowchart TD
      tokens of `tokenizer_config.json`; the chat-template pieces, the RoPE tables, the KV cache and the
      state buffers are built once, and with CUDA graphs on one decoder step is captured for every
      (batch bucket × KV length bucket) pair, sharing one memory pool.
+   - Gemma 4: as for Qwen3-ASR, but the tensors are read straight to the device, the vision tower is
+     skipped, and the per-layer embedding table stays in host memory (section [8](#8-gemma-4-inference)).
+     The tokenizer is `tokenizer.json`.
 5. **App creation and run** (`server.create_app`, `uvicorn.run`): when the app starts (lifespan), the
    AnyIO default thread limit (40) is raised to at least `8 × max_batch_size`. Section
    [4](#4-concurrency-model) explains why.
@@ -145,7 +154,7 @@ The shared handler `run()`:
 2. Reads the whole upload into bytes. An empty file is a 400.
 3. Calls `transcriber.transcribe(audio_bytes, temperature=..., language=..., task=..., prompt=...)`,
    which blocks the request thread until the result is ready.
-4. Formats the result with `render()` (section [8](#8-responses)).
+4. Formats the result with `render()` (section [9](#9-responses)).
 
 The endpoints are plain `def`, not `async def`, so the event loop stays responsive while a request
 waits for inference: FastAPI runs sync endpoints in the AnyIO thread pool.
@@ -504,7 +513,85 @@ and attends over the whole input; on FLEURS with 0.6B the two give the same erro
 3.91%, ja 8.49% vs 8.56% CER). In float32, the transcripts match the transformers backend with the
 window mask exactly on a sample of LibriSpeech and FLEURS files.
 
-## 8. Responses
+## 8. Gemma 4 inference
+
+Implementation: `models/gemma4.py`, a plain PyTorch reimplementation of the audio path of the Gemma 4
+E2B and E4B checkpoints (`google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`: a USM-style audio encoder
+and the Gemma 4 language model; the vision tower is not loaded). The decoding worker follows Qwen3-ASR's
+continuous batching (section [7](#7-qwen3-asr-inference)), with one step at a time.
+
+### 8.1 Request thread: `Gemma4Transcriber.transcribe`
+
+The audio is split into 30-second windows (the model's limit; a trailing window under 0.1 s is dropped,
+a window under 0.1 s zero-padded), and `asrfront.gemma4.log_mel` computes each window's
+`(frames, 128)` features (`(samples - 1) // 160` valid frames). Every window's `_Job` is queued at once
+and the window texts are joined with spaces. `prompt` becomes the system message (its last 224
+tokens). `language` is optional: the prompt names it (`ko` → `Korean`) or asks for the original
+language; the response's `language` is the request's, or `unknown`. Translation is not supported.
+
+### 8.2 The prompt and the output
+
+The model card's ASR prompt, with the audio after the text and
+`N = asrfront.gemma4.num_audio_tokens(frames)` audio placeholders (one per 40 ms, at most 750):
+
+```
+<bos>[<|turn>system\n{prompt}<turn|>\n]
+<|turn>user\nTranscribe the following speech segment in {Language} into {Language} text.\n\n
+Follow these specific instructions for formatting the answer:\n
+* Only output the transcription, with no newlines.\n
+* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, and write 3 instead of three.
+<|audio><|audio|> × N<audio|><turn|>\n
+<|turn>model\n
+```
+
+Without a language, the first sentence is `Transcribe the following speech segment in its original
+language.` The model writes the transcript and stops at `<eos>`, `<turn|>` or `<|tool_response>`
+(`generation_config.json`); the text is the tokens decoded without special tokens. The prompt tokens
+are the ones `Gemma4Processor.apply_chat_template` builds for the same messages.
+
+### 8.3 Worker: admitting windows and decoder steps
+
+- **Admission**: new windows are prefilled in groups of up to 8 (`PREFILL_ROWS`, which bounds the
+  activations and the per-layer embeddings copied over). The group's features are zero-padded to the
+  longest and encoded together (an item's valid tokens do not depend on the padding: the attention is
+  local and only looks back, and the convolutions read zeroed frames past each item). Prompts form
+  one padded batch; the audio embeddings replace the `<|audio|>` embeddings, and attention runs through
+  `scaled_dot_product_attention` with a causal mask (and the 512-token window on sliding layers) that
+  stops at each prompt's length. Every layer with its own keys and values writes them to its row of
+  the cache.
+- **Per-layer embeddings**: every layer adds an input of its own, made from a projection of the token
+  embeddings and a lookup in `embed_tokens_per_layer` (262144 × layers × 256: 4.7 GB for E2B, 5.6 GB
+  for E4B in bfloat16). That table stays in host memory, as the "effective" parameter count intends,
+  which lets E4B run on a 16 GB GPU; the rows of a batch's tokens are looked up there and copied over.
+  Audio positions look up the padding token, as transformers does.
+- **Decoder steps**: each step reads the rows' latest tokens on the host, looks up their per-layer
+  embeddings into a pinned buffer, copies them and the positions into fixed-address inputs, and replays
+  the CUDA graph of the smallest (batch bucket × KV length bucket: 256, 512, 768, 1024, 1280) pair; the
+  graph writes the logits, and the token is chosen outside it (greedy or sampled). The host reads the
+  tokens back after every step, so EOS and length checks cost nothing extra.
+- **The KV cache** (`LayerKV`) holds `(max_batch_size, 1280, kv_heads, head_dim)` keys and values for
+  each layer with its own; a row's prompt (about 820 tokens for 30 s) and generated tokens share them;
+  `limit = min(max_new_tokens or 448, 1280 - prompt_length)`. The last `num_kv_shared_layers` layers
+  (20 of 35 in E2B, 18 of 42 in E4B) have no keys and values: they attend over those of the last earlier
+  layer of their type, so they share its cache.
+
+### 8.4 Network
+
+| Part | Details |
+| --- | --- |
+| Input | log-mel `(frames, 128)`, 100 frames per second, `log(mel + 0.001)` |
+| Audio encoder | 2 × (Conv2d k=3 stride 2 → LayerNorm → ReLU) → linear (25 tokens per second); 12 Conformer layers (half-step SiLU feed-forward, local attention, causal depthwise light convolution, half-step feed-forward, RMSNorm) with clamped linear layers; linear to 1536 |
+| Audio attention | blocks of 12 tokens; each token attends to itself and the 11 before it, with Transformer-XL relative position scores against sinusoids of the distances, logits soft-capped at 50 |
+| Audio embedder | RMSNorm without weight → linear to the language model width |
+| Language model | Gemma 4: embeddings × √width; sliding-window (512, RoPE θ = 10⁴, head_dim 256) and full-attention layers (proportional RoPE θ = 10⁶ on a quarter of the frequencies, head_dim 512); RMSNorm on queries, keys and values, attention without scaling; RMSNorm after attention and MLP; GELU-tanh gated MLP (twice as wide in the KV-shared layers of E2B); per-layer input gate; a per-layer scalar |
+| Output | the tied embedding matrix, logits soft-capped at 30 |
+| Weights | names match the Hugging Face checkpoint (`model.audio_tower...`, `model.embed_audio...`, `model.language_model...`), except that `q_proj`/`k_proj`/`v_proj` and `gate_proj`/`up_proj` are joined into `qkv_proj` and `gate_up_proj`, and the KV-shared layers' unused key and value weights are dropped |
+
+In float32 the audio embeddings match transformers' (5.20's `Gemma4AudioModel`) to about 1e-4
+relative error; in bfloat16 the greedy transcripts of a sample of LibriSpeech and FLEURS ko files are
+token-for-token those of transformers' `generate`.
+
+## 9. Responses
 
 `server.render()` turns a `Transcription` into the requested format:
 
@@ -517,7 +604,7 @@ window mask exactly on a sample of LibriSpeech and FLEURS files.
 
 Segments are 30-second windows; there are no word-level timestamps.
 
-## 9. Evaluation tool (asrback-eval)
+## 10. Evaluation tool (asrback-eval)
 
 Implementation: `evaluation.py`. It sends requests to a running server through the OpenAI client from
 several client processes and measures error rates in the main process.
@@ -555,7 +642,7 @@ flowchart TD
 - **Concurrency**: keep `--concurrency` well above the server's `max_batch_size` so batches fill and
   SenseVoice can group windows of similar length.
 
-## 10. Interactive client (asrback-client)
+## 11. Interactive client (asrback-client)
 
 Implementation: `client.py`. It reads audio file paths at a prompt, sends them to the server and prints
 the results.
@@ -567,7 +654,7 @@ the results.
 4. Prints the status code and message on API errors, or a hint on connection failures, then waits for
    the next path.
 
-## 11. Error handling
+## 12. Error handling
 
 | Situation | Handling |
 | --- | --- |
@@ -576,21 +663,21 @@ the results.
 | Unsupported language, format or temperature; empty file; word timestamps requested | `APIError` → 400 |
 | Task the model cannot do (translation) | `ValueError` from `transcribe()` → 400 |
 | Unknown model id | 404 |
-| Exception during batched inference | The same exception reaches every request of that batch (Whisper, Qwen3-ASR: of every occupied row) and FastAPI answers 500; the worker keeps running |
+| Exception during batched inference | The same exception reaches every request of that batch (Whisper, Qwen3-ASR, Gemma 4: of every occupied row) and FastAPI answers 500; the worker keeps running |
 | Model process exited (`--model-process`) | Pending and later requests raise `RuntimeError` (500) |
 
-## 12. Defaults
+## 13. Defaults
 
-| Item | Whisper | SenseVoice | Qwen3-ASR |
-| --- | --- | --- | --- |
-| dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) |
-| `max_batch_size` | 16 | 32 | 64 (32 in float32) |
-| `batch_wait_ms` | 5 | 5 | 5 |
-| Model process | on (`--no-model-process` to load in the server process) | on | on |
-| CUDA graphs | on with CUDA (decoder steps) | none | on with CUDA (decoder steps) |
-| `--compile-encoder` | off (optional; batch buckets) | off (optional; per layer, dynamic shapes) | not supported |
-| Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once | 30 s windows all at once |
-| Batching | continuous: rows join and leave a pool of `max_batch_size` every 4 steps | batches of similar length | continuous, as for Whisper; prompts prefilled packed |
-| Decoding | greedy or temperature sampling | greedy CTC | greedy or temperature sampling, at most 512 new tokens |
-| Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 | max(40, 8 × 32) = 256 |
-| Eval concurrency | 128 requests from 4 processes | 128 requests from 4 processes | 128 requests from 4 processes |
+| Item | Whisper | SenseVoice | Qwen3-ASR | Gemma 4 |
+| --- | --- | --- | --- | --- |
+| dtype | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) | bfloat16 (CUDA), float32 (CPU) |
+| `max_batch_size` | 16 | 32 | 64 (32 in float32) | 32 (16 in float32) |
+| `batch_wait_ms` | 5 | 5 | 5 | 5 |
+| Model process | on (`--no-model-process` to load in the server process) | on | on | on |
+| CUDA graphs | on with CUDA (decoder steps) | none | on with CUDA (decoder steps) | on with CUDA (decoder steps) |
+| `--compile-encoder` | off (optional; batch buckets) | off (optional; per layer, dynamic shapes) | not supported | not supported |
+| Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once | 30 s windows all at once | 30 s windows all at once |
+| Batching | continuous: rows join and leave a pool of `max_batch_size` every 4 steps | batches of similar length | continuous, as for Whisper; prompts prefilled packed | continuous, every step; prompts prefilled 8 at a time, padded |
+| Decoding | greedy or temperature sampling | greedy CTC | greedy or temperature sampling, at most 512 new tokens | greedy or temperature sampling, at most 448 new tokens |
+| Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 | max(40, 8 × 32) = 256 | max(40, 8 × 32) = 256 |
+| Eval concurrency | 128 requests from 4 processes | 128 requests from 4 processes | 128 requests from 4 processes | 128 requests from 4 processes |

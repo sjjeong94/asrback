@@ -14,7 +14,12 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from . import __version__
 from .model_process import ProcessTranscriber
-from .models import Qwen3ASRTranscriber, SenseVoiceTranscriber, Transcriber
+from .models import (
+    Gemma4Transcriber,
+    Qwen3ASRTranscriber,
+    SenseVoiceTranscriber,
+    Transcriber,
+)
 from .transcription import Transcription
 
 RESPONSE_FORMATS = ("json", "text", "srt", "verbose_json", "vtt")
@@ -90,7 +95,11 @@ def render(result: Transcription, response_format: str) -> Response:
 
 def create_app(
     transcriber: (
-        Transcriber | SenseVoiceTranscriber | Qwen3ASRTranscriber | ProcessTranscriber
+        Transcriber
+        | SenseVoiceTranscriber
+        | Qwen3ASRTranscriber
+        | Gemma4Transcriber
+        | ProcessTranscriber
     ),
     model_name: str,
 ) -> FastAPI:
