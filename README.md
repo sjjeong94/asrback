@@ -41,7 +41,7 @@ Gemma 4 E2B and E4B transcribe with the model card's ASR prompt, which names the
 language; the response reports the request's language, or `unknown`. `prompt` becomes the
 system message. It does not translate. The vision tower is not loaded, and the per-layer
 embedding table (4.7 GB for E2B, 5.6 GB for E4B) stays in host memory, so E4B fits on a
-16 GB GPU (about 15.8 GB in use at the default batch size of 32; use a smaller
+16 GB GPU (about 16 GB in use at the default batch size of 32; use a smaller
 `--max-batch-size` if it runs out of memory).
 
 Endpoints:
@@ -105,18 +105,24 @@ server detect it. Japanese, Korean and other languages in which word boundaries 
 missing or too coarse are scored by character error rate (spaces ignored), and the
 rest by word error rate. `--metric wer|cer` overrides this.
 
-Gemma 4 E2B and E4B (bfloat16, greedy, RTX 5060 Ti 16 GB, default options):
+Results on the full test sets with every model's defaults (bfloat16, greedy, the
+dataset's language), one RTX 5060 Ti 16 GB; RTFx in parentheses:
 
 | Model | LibriSpeech test-clean WER | FLEURS en_us WER | FLEURS ko_kr CER | FLEURS ja_jp CER |
 | --- | --- | --- | --- | --- |
-| Gemma 4 E2B | 3.64% (RTFx 94) | 8.82% | 5.30% | 10.26% |
-| Gemma 4 E4B | 3.05% (RTFx 59) | 7.05% | 3.70% | 7.57% |
+| Whisper tiny | 7.51% (1439) | 15.93% (1628) | 17.71% (1695) | 43.94% (1519) |
+| Whisper base | 5.02% (975) | 13.02% (1202) | 13.94% (1134) | 25.15% (1099) |
+| Whisper small | 3.42% (400) | 8.25% (493) | 5.83% (525) | 12.82% (491) |
+| Whisper large-v3-turbo | 2.06% (128) | 6.09% (168) | 3.35% (206) | 6.09% (204) |
+| SenseVoice Small | 3.45% (1468) | 9.06% (1816) | 6.62% (1753) | 7.56% (1911) |
+| Qwen3-ASR 0.6B | 2.12% (670) | 5.78% (720) | 3.92% (667) | 8.50% (721) |
+| Qwen3-ASR 1.7B | **1.65%** (392) | **4.70%** (416) | **2.60%** (390) | **5.35%** (420) |
+| Gemma 4 E2B | 3.63% (92) | 8.82% (111) | 5.32% (117) | 10.25% (123) |
+| Gemma 4 E4B | 3.05% (58) | 7.10% (70) | 3.68% (75) | 7.57% (76) |
 
-```bash
-scripts/download_gemma4_hf.sh E2B
-uv run asrback --model-dir models/gemma-4-e2b-it --port 8000
-uv run asrback-eval --base-url http://127.0.0.1:8000/v1 --dataset data/fleurs/ko_kr
-```
+Batches form in a different order from run to run, so bfloat16 error rates can move by
+a few hundredths of a percent. RTFx is total audio over wall time as `asrback-eval` sees
+it, so it depends on the GPU and the client settings as well as the model.
 
 Use `--limit N` for a quick run and `--output predictions.jsonl` to save per-utterance
 results; add `--resume` to skip utterances already in that file. Text is normalized
