@@ -30,8 +30,8 @@ def load_transcriber(
 ) -> Transcriber | SenseVoiceTranscriber | Qwen3ASRTranscriber | Gemma4Transcriber:
     """Load the Whisper, SenseVoice, Qwen3-ASR or Gemma 4 checkpoint in ``model_dir``.
 
-    ``options`` (device, dtype, max_batch_size, batch_wait_ms) apply to every
-    model; ``compile_encoder`` to Whisper and SenseVoice; ``cuda_graphs`` to
+    ``options`` (device, dtype, max_batch_size, batch_wait_ms, max_audio_seconds)
+    apply to every model; ``compile_encoder`` to Whisper and SenseVoice; ``cuda_graphs`` to
     Whisper, Qwen3-ASR and Gemma 4; ``condition_on_previous_text`` to Whisper
     only. Options left as ``None`` take the model's default.
     """

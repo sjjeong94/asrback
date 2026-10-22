@@ -145,10 +145,13 @@ Endpoints (`server.py`):
 | `POST /v1/audio/transcriptions` | 400 if `timestamp_granularities[]` contains `word`, or if `language` is not supported. Then `run(..., task="transcribe")` |
 | `POST /v1/audio/translations` | `run(..., task="translate")`. Models that cannot translate (`*.en`, SenseVoice, Qwen3-ASR) raise `ValueError` in `transcribe()`, which becomes a 400 |
 | `GET /v1/models`, `GET /v1/models/{id}` | Lists the single loaded model (id from `--model-name` or the directory name). The request's `model` field is ignored |
-| `GET /health` | `{"status": "ok"}`, or 503 when the model process has exited (`--model-process`) |
+| `GET /health` | `{"status": "ok"}`, or 503 when the model process has exited (`--model-process`) or the decoding worker has stopped |
 
 The shared handler `run()`:
 
+0. With `--max-concurrent-requests N`, the `ConcurrencyLimit` middleware has already answered 429
+   (`Retry-After: 1`) if N audio requests were in flight. It runs before the multipart body is read,
+   so rejected uploads cost nothing. Other paths (`/health`, `/v1/models`) are not counted.
 1. Checks that `response_format` is one of `json`, `text`, `srt`, `vtt`, `verbose_json` and that
    `temperature` is between 0 and 1.
 2. Reads the whole upload into bytes. An empty file is a 400.
@@ -193,7 +196,17 @@ flowchart LR
   fewer windows to group by length. The lifespan hook therefore raises the limit to
   `8 × max_batch_size` (at least 40).
 - **Errors**: if batched inference raises, the same exception goes into every `Future` of that batch.
-  The worker keeps running.
+  The worker then calls `raise_if_device_failed` (a `torch.cuda.synchronize`). After an error that
+  leaves the device usable, such as an out-of-memory, the synchronize succeeds and the worker keeps
+  running. After an error that poisons the CUDA context, such as an illegal memory access, it raises
+  again and the worker stops: otherwise every later request would fail on a device that cannot recover.
+- **A stopped worker** (`transcription.Worker`): request threads wait on their `Future` through
+  `Worker.wait`, which checks every second (`WAIT_POLL_SECONDS`) that the worker still runs. If the
+  worker has stopped, waiting requests and later ones raise `RuntimeError` (500) instead of waiting
+  forever, and the transcriber's `alive` is false, so `/health` answers 503.
+- **Audio length**: with `--max-audio-seconds`, `transcription.load_audio` passes the limit to
+  `asrfront.load(max_duration=...)`, which raises `ValueError` (400) before most of a long file is
+  decoded. A waveform passed as an array is checked by its length.
 
 ### 4.1 Model process (`--model-process`, default)
 
@@ -222,7 +235,8 @@ flowchart LR
 - Exceptions from `transcribe()` (for example the `ValueError` of an unsupported task) are sent back and
   raised by the caller, so they become 400s as before.
 - The model process ignores SIGINT and is a daemon: it stops with the server process, and it exits when
-  the pipe closes. If it dies, pending and later requests fail with `RuntimeError` (500) and `/health`
+  the pipe closes. It also exits when its decoding worker stops (a watch thread checks `alive` every
+  second), so the server process sees the pipe close. If it dies, pending and later requests fail with `RuntimeError` (500) and `/health`
   answers 503, so a supervisor can restart the server.
 - Measured with a lightweight multi-process client on LibriSpeech test-clean (RTX 5060 Ti): SenseVoice
   11.1–11.5 s → 9.4–9.5 s (GPU busy 64% → 77%); whisper-small 60.8 s → 59.3 s (already GPU-bound).
@@ -663,7 +677,10 @@ the results.
 | Unsupported language, format or temperature; empty file; word timestamps requested | `APIError` → 400 |
 | Task the model cannot do (translation) | `ValueError` from `transcribe()` → 400 |
 | Unknown model id | 404 |
-| Exception during batched inference | The same exception reaches every request of that batch (Whisper, Qwen3-ASR, Gemma 4: of every occupied row) and FastAPI answers 500; the worker keeps running |
+| Audio longer than `--max-audio-seconds` | `ValueError` from `load_audio` → 400 |
+| More than `--max-concurrent-requests` audio requests in flight | 429 with `Retry-After: 1`, before the upload is read |
+| Exception during batched inference | The same exception reaches every request of that batch (Whisper, Qwen3-ASR, Gemma 4: of every occupied row) and FastAPI answers 500; the worker keeps running if the device is still usable |
+| Device error the CUDA context cannot recover from | The worker stops; waiting and later requests raise `RuntimeError` (500) within a second, and `/health` answers 503 (with `--model-process`, the model process exits) |
 | Model process exited (`--model-process`) | Pending and later requests raise `RuntimeError` (500) |
 
 ## 13. Defaults

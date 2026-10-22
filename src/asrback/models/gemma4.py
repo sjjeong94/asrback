@@ -20,7 +20,6 @@ import json
 import math
 import os
 import queue
-import threading
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -40,8 +39,11 @@ from ..transcription import (
     CapturedGraph,
     Segment,
     Transcription,
+    Worker,
     compression_ratio,
     gather_batch,
+    load_audio,
+    raise_if_device_failed,
     to_device,
 )
 
@@ -834,6 +836,7 @@ class Gemma4Transcriber:
         max_batch_size: int | None = None,
         batch_wait_ms: float = 5.0,
         cuda_graphs: bool | None = None,
+        max_audio_seconds: float | None = None,
     ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
@@ -843,6 +846,8 @@ class Gemma4Transcriber:
             raise ValueError("max_batch_size must be greater than zero")
         if batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be non-negative")
+        if max_audio_seconds is not None and max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be greater than zero")
 
         self.model_dir = model_dir
         self.config = load_json(model_dir / "config.json")
@@ -869,6 +874,7 @@ class Gemma4Transcriber:
             max_batch_size = 32 if dtype == torch.bfloat16 else 16
         self.max_batch_size = max_batch_size
         self.batch_wait = batch_wait_ms / 1000
+        self.max_audio_seconds = max_audio_seconds
 
         first_shared = text["num_hidden_layers"] - text["num_kv_shared_layers"]
         shared = set(range(first_shared, text["num_hidden_layers"]))
@@ -983,7 +989,12 @@ class Gemma4Transcriber:
             self._capture_graphs()
 
         self._queue: queue.SimpleQueue[_Job] = queue.SimpleQueue()
-        threading.Thread(target=self._serve, name="asrback-gemma4", daemon=True).start()
+        self._worker = Worker(self._serve, "asrback-gemma4")
+
+    @property
+    def alive(self) -> bool:
+        """Whether the decoding worker still runs."""
+        return self._worker.alive
 
     def _load_weights(self) -> dict[str, Tensor]:
         """The checkpoint's tensors, without the vision tower, read straight to the
@@ -1039,10 +1050,7 @@ class Gemma4Transcriber:
         if max_new_tokens is not None and max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be greater than zero")
 
-        if isinstance(audio, np.ndarray) and audio.dtype != np.uint8:
-            waveform = np.asarray(audio, dtype=np.float32)
-        else:
-            waveform = asrfront.load(audio)
+        waveform = load_audio(audio, self.max_audio_seconds)
         duration = len(waveform) / SAMPLE_RATE
         context = []
         if prompt and prompt.strip():
@@ -1070,7 +1078,7 @@ class Gemma4Transcriber:
 
         segments = []
         for seek, length, job in windows:
-            tokens, avg_logprob = job.future.result()
+            tokens, avg_logprob = self._worker.wait(job.future)
             text = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
             segments.append(
                 Segment(
@@ -1154,6 +1162,7 @@ class Gemma4Transcriber:
                 # A failed step leaves every row's state unknown: fail them all.
                 for slot in list(self._rows):
                     self._rows.pop(slot).job.future.set_exception(exc)
+                raise_if_device_failed(self.device)
 
     def _prompt(self, job: _Job) -> list[int]:
         audio = [self._audio_id] * asrfront.gemma4.num_audio_tokens(job.frames)
@@ -1235,6 +1244,7 @@ class Gemma4Transcriber:
         except BaseException as exc:
             for job in jobs:
                 job.future.set_exception(exc)
+            raise_if_device_failed(self.device)
             return
         for slot, job, length, first, first_logprob in zip(
             slots, jobs, lengths, token, logprob

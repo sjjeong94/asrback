@@ -15,7 +15,6 @@ import math
 import os
 import queue
 import re
-import threading
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -37,8 +36,11 @@ from ..transcription import (
     CapturedGraph,
     Segment,
     Transcription,
+    Worker,
     compression_ratio,
     gather_batch,
+    load_audio,
+    raise_if_device_failed,
     to_device,
 )
 
@@ -717,6 +719,7 @@ class Qwen3ASRTranscriber:
         max_batch_size: int | None = None,
         batch_wait_ms: float = 5.0,
         cuda_graphs: bool | None = None,
+        max_audio_seconds: float | None = None,
     ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
@@ -726,6 +729,8 @@ class Qwen3ASRTranscriber:
             raise ValueError("max_batch_size must be greater than zero")
         if batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be non-negative")
+        if max_audio_seconds is not None and max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be greater than zero")
 
         self.model_dir = model_dir
         self.config = load_json(model_dir / "config.json")
@@ -748,6 +753,7 @@ class Qwen3ASRTranscriber:
             max_batch_size = 64 if dtype == torch.bfloat16 else 32
         self.max_batch_size = max_batch_size
         self.batch_wait = batch_wait_ms / 1000
+        self.max_audio_seconds = max_audio_seconds
 
         # Built without allocating; the checkpoint's tensors take the parameters' place.
         with torch.device("meta"):
@@ -825,9 +831,12 @@ class Qwen3ASRTranscriber:
             self._capture_graphs()
 
         self._queue: queue.SimpleQueue[_Job] = queue.SimpleQueue()
-        threading.Thread(
-            target=self._serve, name="asrback-qwen3-asr", daemon=True
-        ).start()
+        self._worker = Worker(self._serve, "asrback-qwen3-asr")
+
+    @property
+    def alive(self) -> bool:
+        """Whether the decoding worker still runs."""
+        return self._worker.alive
 
     def _load_weights(self) -> dict[str, Tensor]:
         index = self.model_dir / "model.safetensors.index.json"
@@ -869,10 +878,7 @@ class Qwen3ASRTranscriber:
         if max_new_tokens is not None and max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be greater than zero")
 
-        if isinstance(audio, np.ndarray) and audio.dtype != np.uint8:
-            waveform = np.asarray(audio, dtype=np.float32)
-        else:
-            waveform = asrfront.load(audio)
+        waveform = load_audio(audio, self.max_audio_seconds)
         duration = len(waveform) / SAMPLE_RATE
         context = []
         if prompt and prompt.strip():
@@ -895,7 +901,7 @@ class Qwen3ASRTranscriber:
         segments = []
         detected = None
         for seek, length, job in windows:
-            result = self._parse(*job.future.result(), job.language)
+            result = self._parse(*self._worker.wait(job.future), job.language)
             detected = detected or result.language
             segments.append(
                 Segment(
@@ -971,6 +977,7 @@ class Qwen3ASRTranscriber:
                 rows = list(self._rows)
                 for slot in rows:
                     self._rows.pop(slot).job.future.set_exception(exc)
+                raise_if_device_failed(self.device)
                 self._state.free(torch.tensor(rows, device=self.device))
 
     def _prompt(self, job: _Job) -> list[int]:
@@ -1069,6 +1076,7 @@ class Qwen3ASRTranscriber:
         except BaseException as exc:
             for job in jobs:
                 job.future.set_exception(exc)
+            raise_if_device_failed(self.device)
             self._state.free(torch.tensor(slots, device=self.device))
             return
         # No transfer to the host here: it would wait for the GPU and leave it idle.

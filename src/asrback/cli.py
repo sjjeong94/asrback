@@ -75,6 +75,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "together. Default: on",
     )
     parser.add_argument(
+        "--max-audio-seconds",
+        type=float,
+        default=None,
+        help="Reject (400) audio longer than this many seconds, before most of it "
+        "is decoded. Default: no limit",
+    )
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=None,
+        help="Answer 429 to audio requests while this many are in flight, before "
+        "reading their upload. Default: no limit",
+    )
+    parser.add_argument(
         "--model-process",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -88,6 +102,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-batch-size must be greater than zero")
     if args.batch_wait_ms < 0:
         parser.error("--batch-wait-ms must be non-negative")
+    if args.max_audio_seconds is not None and args.max_audio_seconds <= 0:
+        parser.error("--max-audio-seconds must be greater than zero")
+    if args.max_concurrent_requests is not None and args.max_concurrent_requests <= 0:
+        parser.error("--max-concurrent-requests must be greater than zero")
     return args
 
 
@@ -114,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             cuda_graphs=args.cuda_graphs,
             compile_encoder=args.compile_encoder,
             condition_on_previous_text=args.condition_on_previous_text,
+            max_audio_seconds=args.max_audio_seconds,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -124,5 +143,6 @@ def main(argv: list[str] | None = None) -> int:
         f"batch {transcriber.max_batch_size}, "
         f"CUDA graphs {'on' if transcriber.cuda_graphs else 'off'}) as {model_name!r}"
     )
-    uvicorn.run(create_app(transcriber, model_name), host=args.host, port=args.port)
+    app = create_app(transcriber, model_name, args.max_concurrent_requests)
+    uvicorn.run(app, host=args.host, port=args.port)
     return 0

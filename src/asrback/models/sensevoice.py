@@ -11,7 +11,6 @@ from __future__ import annotations
 import math
 import os
 import queue
-import threading
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,8 +29,11 @@ from ..transcription import (
     AudioSource,
     Segment,
     Transcription,
+    Worker,
     compression_ratio,
     gather_batch,
+    load_audio,
+    raise_if_device_failed,
     to_device,
 )
 
@@ -323,6 +325,7 @@ class SenseVoiceTranscriber:
         batch_wait_ms: float = 5.0,
         use_itn: bool = True,
         compile_encoder: bool = False,
+        max_audio_seconds: float | None = None,
     ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
@@ -332,6 +335,8 @@ class SenseVoiceTranscriber:
             raise ValueError("max_batch_size must be greater than zero")
         if batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be non-negative")
+        if max_audio_seconds is not None and max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be greater than zero")
 
         self.model_dir = model_dir
         with (model_dir / "config.yaml").open(encoding="utf-8") as file:
@@ -357,6 +362,7 @@ class SenseVoiceTranscriber:
         self.dtype = dtype
         self.max_batch_size = max_batch_size
         self.batch_wait = batch_wait_ms / 1000
+        self.max_audio_seconds = max_audio_seconds
 
         model = SenseVoiceModel(self.config, self.tokenizer.get_piece_size())
         # model.pt is a pickle; weights_only refuses anything but tensors.
@@ -390,9 +396,12 @@ class SenseVoiceTranscriber:
             self._compile_encoder()
 
         self._queue: queue.SimpleQueue[_Job] = queue.SimpleQueue()
-        threading.Thread(
-            target=self._serve, name="asrback-sensevoice", daemon=True
-        ).start()
+        self._worker = Worker(self._serve, "asrback-sensevoice")
+
+    @property
+    def alive(self) -> bool:
+        """Whether the decoding worker still runs."""
+        return self._worker.alive
 
     def transcribe(
         self,
@@ -415,10 +424,7 @@ class SenseVoiceTranscriber:
         if temperature < 0:
             raise ValueError("temperature must be non-negative")
 
-        if isinstance(audio, np.ndarray) and audio.dtype != np.uint8:
-            waveform = np.asarray(audio, dtype=np.float32)
-        else:
-            waveform = asrfront.load(audio)
+        waveform = load_audio(audio, self.max_audio_seconds)
         duration = len(waveform) / SAMPLE_RATE
 
         # Windows are independent, so all of them are queued at once.
@@ -435,7 +441,7 @@ class SenseVoiceTranscriber:
         segments = []
         detected = None
         for seek, length, job in windows:
-            result: _Result = job.future.result()
+            result: _Result = self._worker.wait(job.future)
             detected = detected or result.language
             segments.append(
                 Segment(
@@ -487,12 +493,14 @@ class SenseVoiceTranscriber:
                 except BaseException as exc:
                     for job in jobs:
                         job.future.set_exception(exc)
+                    raise_if_device_failed(self.device)
             if running is not None:
                 try:
                     results = self._collect(running)
                 except BaseException as exc:
                     for job in running.jobs:
                         job.future.set_exception(exc)
+                    raise_if_device_failed(self.device)
                 else:
                     for job, result in zip(running.jobs, results):
                         job.future.set_result(result)

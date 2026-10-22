@@ -47,6 +47,38 @@ def error_response(
     return JSONResponse({"error": body}, status_code=status_code)
 
 
+class ConcurrencyLimit:
+    """ASGI middleware: answer 429 to an audio request while ``limit`` others are
+    in flight, before its upload is read, so overload cannot pile up requests
+    (and their uploads) inside the server."""
+
+    def __init__(self, app, limit: int) -> None:
+        self.app = app
+        self.limit = limit
+        # Requests run on one event loop, so a plain counter is enough.
+        self.active = 0
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or not scope["path"].startswith("/v1/audio/"):
+            await self.app(scope, receive, send)
+            return
+        if self.active >= self.limit:
+            response = error_response(
+                f"The server is busy ({self.limit} requests in flight); retry later.",
+                429,
+                None,
+                "rate_limit_exceeded",
+            )
+            response.headers["Retry-After"] = "1"
+            await response(scope, receive, send)
+            return
+        self.active += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.active -= 1
+
+
 def format_timestamp(seconds: float, separator: str) -> str:
     milliseconds = round(seconds * 1000)
     hours, milliseconds = divmod(milliseconds, 3_600_000)
@@ -102,8 +134,10 @@ def create_app(
         | ProcessTranscriber
     ),
     model_name: str,
+    max_concurrent_requests: int | None = None,
 ) -> FastAPI:
-    """Build the app. Requests may name any model; ``model_name`` is what we list."""
+    """Build the app. Requests may name any model; ``model_name`` is what we list.
+    With ``max_concurrent_requests``, audio requests beyond it get a 429."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -111,10 +145,16 @@ def create_app(
         # request holds a thread while it waits for its batch. Allow several batches'
         # worth so the batcher can group windows of similar length.
         limiter = anyio.to_thread.current_default_thread_limiter()
-        limiter.total_tokens = max(limiter.total_tokens, 8 * transcriber.max_batch_size)
+        limiter.total_tokens = max(
+            limiter.total_tokens,
+            8 * transcriber.max_batch_size,
+            max_concurrent_requests or 0,
+        )
         yield
 
     app = FastAPI(title="asrback", version=__version__, lifespan=lifespan)
+    if max_concurrent_requests is not None:
+        app.add_middleware(ConcurrencyLimit, limit=max_concurrent_requests)
     created = int(time.time())
 
     @app.exception_handler(APIError)
@@ -216,11 +256,13 @@ def create_app(
 
     @app.get("/health")
     def health() -> Response:
-        if isinstance(transcriber, ProcessTranscriber) and not transcriber.alive:
-            return JSONResponse(
-                {"status": "error", "detail": "the model process has exited"},
-                status_code=503,
+        if not transcriber.alive:
+            detail = (
+                "the model process has exited"
+                if isinstance(transcriber, ProcessTranscriber)
+                else "the decoding worker has stopped"
             )
+            return JSONResponse({"status": "error", "detail": detail}, status_code=503)
         return JSONResponse({"status": "ok"})
 
     return app

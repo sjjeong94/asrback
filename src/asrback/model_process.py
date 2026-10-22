@@ -14,7 +14,9 @@ import itertools
 import multiprocessing
 import os
 import signal
+import sys
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing.connection import Connection
 
@@ -31,6 +33,8 @@ ATTRIBUTES = (
     "languages",
     "task_ids",
 )
+# How often the model process checks that its decoding worker still runs.
+WATCH_SECONDS = 1.0
 
 
 class ProcessTranscriber:
@@ -122,6 +126,20 @@ def _serve(
     )
 
     send_lock = threading.Lock()
+
+    def watch() -> None:
+        # A stopped worker cannot be restarted: exit, so the server process fails
+        # the pending requests and reports the model process as gone.
+        while transcriber.alive:
+            time.sleep(WATCH_SECONDS)
+        print(
+            "asrback: the decoding worker stopped; exiting the model process",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(1)
+
+    threading.Thread(target=watch, name="asrback-watch", daemon=True).start()
 
     def run(request_id: int, audio: AudioSource, options: dict) -> None:
         try:

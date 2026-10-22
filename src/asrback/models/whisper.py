@@ -14,7 +14,6 @@ import math
 import os
 import queue
 import re
-import threading
 from collections import deque
 from concurrent.futures import Future
 from contextlib import nullcontext
@@ -36,8 +35,11 @@ from ..transcription import (
     CapturedGraph,
     Segment,
     Transcription,
+    Worker,
     compression_ratio,
     gather_batch,
+    load_audio,
+    raise_if_device_failed,
     to_device,
 )
 
@@ -468,6 +470,7 @@ class Transcriber:
         cuda_graphs: bool | None = None,
         compile_encoder: bool = False,
         condition_on_previous_text: bool = True,
+        max_audio_seconds: float | None = None,
     ):
         model_dir = Path(model_dir)
         for filename in REQUIRED_FILES:
@@ -477,6 +480,8 @@ class Transcriber:
             raise ValueError("max_batch_size must be greater than zero")
         if batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be non-negative")
+        if max_audio_seconds is not None and max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be greater than zero")
 
         self.model_dir = model_dir
         self.config = load_json(model_dir / "config.json")
@@ -497,6 +502,7 @@ class Transcriber:
         self.cuda_graphs = cuda_graphs
         self.max_batch_size = max_batch_size
         self.batch_wait = batch_wait_ms / 1000
+        self.max_audio_seconds = max_audio_seconds
         self.condition_on_previous_text = condition_on_previous_text
 
         model = WhisperForConditionalGeneration(self.config)
@@ -572,9 +578,12 @@ class Transcriber:
             self._capture_graphs()
 
         self._queue: queue.SimpleQueue[_Job] = queue.SimpleQueue()
-        threading.Thread(
-            target=self._serve, name="asrback-decoder", daemon=True
-        ).start()
+        self._worker = Worker(self._serve, "asrback-decoder")
+
+    @property
+    def alive(self) -> bool:
+        """Whether the decoding worker still runs."""
+        return self._worker.alive
 
     def transcribe(
         self,
@@ -600,10 +609,7 @@ class Transcriber:
         if max_new_tokens is not None and max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be greater than zero")
 
-        if isinstance(audio, np.ndarray) and audio.dtype != np.uint8:
-            waveform = np.asarray(audio, dtype=np.float32)
-        else:
-            waveform = asrfront.load(audio)
+        waveform = load_audio(audio, self.max_audio_seconds)
         duration = len(waveform) / SAMPLE_RATE
 
         history = []
@@ -624,7 +630,7 @@ class Transcriber:
         if self.condition_on_previous_text:
             # Windows are decoded in order: each one is conditioned on earlier text.
             for _, _, log_mel in windows:
-                result = submit(log_mel, history[-context:]).result()
+                result = self._worker.wait(submit(log_mel, history[-context:]))
                 language = result.language
                 history.extend(result.tokens)
                 results.append(result)
@@ -633,10 +639,11 @@ class Transcriber:
             # detects when not given; the rest are queued at once to share batches.
             log_mels = [log_mel for _, _, log_mel in windows]
             if language is None:
-                results.append(submit(log_mels.pop(0), history[-context:]).result())
+                first = submit(log_mels.pop(0), history[-context:])
+                results.append(self._worker.wait(first))
                 language = results[0].language
             futures = [submit(log_mel, history[-context:]) for log_mel in log_mels]
-            results.extend(future.result() for future in futures)
+            results.extend(self._worker.wait(future) for future in futures)
 
         segments = []
         for (seek, length, _), result in zip(windows, results):
@@ -748,6 +755,7 @@ class Transcriber:
                 rows = list(self._rows)
                 for slot in rows:
                     self._rows.pop(slot).job.future.set_exception(exc)
+                raise_if_device_failed(self.device)
                 self._state.free(torch.tensor(rows, device=self.device))
 
     def _sot(self, language: str, task: str) -> list[int]:
@@ -805,6 +813,7 @@ class Transcriber:
         except BaseException as exc:
             for job in jobs:
                 job.future.set_exception(exc)
+            raise_if_device_failed(self.device)
             self._state.free(torch.tensor(slots, device=self.device))
             return
         self._rows.update(rows)

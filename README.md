@@ -54,6 +54,17 @@ Endpoints:
 Supported response formats are `json`, `text`, `srt`, `vtt` and `verbose_json`.
 Audio longer than 30 seconds is decoded in 30-second windows.
 
+Two options protect a shared server, and both are off by default:
+
+- `--max-audio-seconds N` rejects longer audio with a 400, before most of it is decoded.
+- `--max-concurrent-requests N` answers 429 (`Retry-After: 1`) to audio requests while
+  N are in flight, before reading their upload. OpenAI clients retry a 429 on their own.
+
+`/health` answers 503 once the model can no longer serve. This happens when the model
+process has exited, or when the decoding worker has stopped after a device error it
+cannot recover from (such as an illegal memory access). Requests then fail with a 500
+instead of waiting, so a supervisor can restart the server.
+
 Concurrent requests are decoded together in batches. Options that affect speed:
 
 | Option | Default | |
@@ -189,6 +200,15 @@ rates.
 - One model per server process.
 - English-only (`*.en`), SenseVoice and Qwen3-ASR models support transcription only,
   not translation.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The tests in `tests/test_models.py` use `models/sensevoice-small`, `models/qwen3-asr-0.6b`
+and LibriSpeech test-clean, and are skipped when those have not been downloaded.
 
 ## License
 

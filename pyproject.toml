@@ -45,8 +45,10 @@ dev = [
     "asrback[eval]",
     "black",
     "flake8",
+    "httpx>=0.28.1",
     "isort",
     "pre-commit",
+    "pytest>=9.1.1",
 ]
 
 [tool.black]
