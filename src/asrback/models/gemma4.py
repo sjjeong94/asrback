@@ -44,6 +44,7 @@ from ..transcription import (
     gather_batch,
     load_audio,
     raise_if_device_failed,
+    split_on_out_of_memory,
     to_device,
 )
 
@@ -1242,6 +1243,11 @@ class Gemma4Transcriber:
             token, logprob = self._choose(logits, self._temperatures(jobs))
             token, logprob = token.tolist(), logprob.tolist()
         except BaseException as exc:
+            if split_on_out_of_memory(exc, jobs):
+                half = len(jobs) // 2
+                self._admit(jobs[:half])
+                self._admit(jobs[half:])
+                return
             for job in jobs:
                 job.future.set_exception(exc)
             raise_if_device_failed(self.device)

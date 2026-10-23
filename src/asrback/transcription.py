@@ -71,6 +71,11 @@ def load_audio(audio: AudioSource, max_seconds: float | None = None) -> np.ndarr
     return asrfront.load(audio, max_duration=max_seconds)
 
 
+class ModelUnavailableError(RuntimeError):
+    """The decoding worker or the model process has stopped: this and every later
+    request fail until the server restarts."""
+
+
 class Worker:
     """A transcriber's decoding thread.
 
@@ -104,7 +109,7 @@ class Worker:
                 return future.result(timeout=WAIT_POLL_SECONDS)
             except concurrent.futures.TimeoutError:
                 if not self.alive and not future.done():
-                    raise RuntimeError(
+                    raise ModelUnavailableError(
                         f"the decoding worker has stopped: {self.error!r}"
                     ) from self.error
 
@@ -116,6 +121,13 @@ def raise_if_device_failed(device: torch.device) -> None:
     rather than failing every request that follows."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def split_on_out_of_memory(exc: BaseException, jobs: list) -> bool:
+    """Whether a batch of ``jobs`` that failed with ``exc`` should be retried in
+    halves: an out-of-memory error leaves the device usable, and smaller batches
+    may fit, so one large batch does not fail every request in it."""
+    return isinstance(exc, torch.OutOfMemoryError) and len(jobs) > 1
 
 
 def to_device(data, device: torch.device) -> torch.Tensor:

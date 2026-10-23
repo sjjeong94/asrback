@@ -8,8 +8,13 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 
-from asrback.server import ConcurrencyLimit, create_app, format_timestamp
-from asrback.transcription import Segment, Transcription
+from asrback.server import (
+    BodySizeLimit,
+    ConcurrencyLimit,
+    create_app,
+    format_timestamp,
+)
+from asrback.transcription import ModelUnavailableError, Segment, Transcription
 
 
 class FakeTranscriber:
@@ -126,6 +131,23 @@ def test_value_error_is_a_400(client):
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
+@pytest.mark.parametrize(
+    "error, status",
+    [
+        (ModelUnavailableError("the model process has exited"), 503),
+        (RuntimeError("CUDA out of memory"), 500),
+    ],
+)
+def test_transcription_errors_are_api_errors(client, transcriber, error, status):
+    def fail(audio, **options):
+        raise error
+
+    transcriber.transcribe = fail
+    response = post(client)
+    assert response.status_code == status
+    assert response.json()["error"]["type"] == "server_error"
+
+
 def test_models(client):
     assert client.get("/v1/models").json()["data"][0]["id"] == "fake"
     assert client.get("/v1/models/fake").json()["id"] == "fake"
@@ -208,3 +230,68 @@ def test_concurrency_limit_in_the_app(transcriber):
         first.join()
         assert responses[0].status_code == 200
         assert post(client).status_code == 200
+
+
+def test_body_size_limit():
+    """Bodies over the limit get a 413, by Content-Length or once a chunked body
+    passes it; other paths are not limited."""
+
+    async def app(scope, receive, send):
+        while (await receive()).get("more_body"):
+            pass
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def request(path: str, chunks: list[bytes], length: bool) -> int:
+        statuses = []
+        messages = [
+            {"type": "http.request", "body": chunk, "more_body": i < len(chunks) - 1}
+            for i, chunk in enumerate(chunks)
+        ]
+
+        async def receive():
+            return messages.pop(0)
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                statuses.append(message["status"])
+
+        headers = []
+        if length:
+            headers.append((b"content-length", str(sum(map(len, chunks))).encode()))
+        scope = {"type": "http", "path": path, "method": "POST", "headers": headers}
+        await BodySizeLimit(app, limit=10)(scope, receive, send)
+        assert len(statuses) == 1
+        return statuses[0]
+
+    async def main():
+        audio = "/v1/audio/transcriptions"
+        assert await request(audio, [b"x" * 10], length=True) == 200
+        assert await request(audio, [b"x" * 11], length=True) == 413
+        assert await request(audio, [b"x" * 6, b"x" * 4], length=False) == 200
+        assert await request(audio, [b"x" * 6, b"x" * 6], length=False) == 413
+        assert await request("/health", [b"x" * 11], length=True) == 200
+
+    asyncio.run(main())
+
+
+def test_body_size_limit_in_the_app(transcriber):
+    app = create_app(transcriber, "fake", max_upload_bytes=1000)
+    with TestClient(app) as client:
+        assert post(client, audio=b"x" * 100).status_code == 200
+        response = post(client, audio=b"x" * 2000)
+        assert response.status_code == 413
+        assert response.json()["error"]["param"] == "file"
+        assert transcriber.calls == [transcriber.calls[0]]
+
+        # A chunked upload, without Content-Length.
+        def chunks():
+            yield b"x" * 600
+            yield b"x" * 600
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            content=chunks(),
+            headers={"content-type": "multipart/form-data; boundary=b"},
+        )
+        assert response.status_code == 413

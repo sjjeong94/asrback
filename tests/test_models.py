@@ -8,16 +8,19 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
-from asrback.models import qwen3_asr, sensevoice
+from asrback.models import Transcriber, qwen3_asr, sensevoice
 from asrback.models.qwen3_asr import Qwen3ASRTranscriber
 from asrback.models.sensevoice import SenseVoiceTranscriber
+from asrback.transcription import SAMPLE_RATE, load_audio
 
 ROOT = Path(__file__).resolve().parent.parent
 AUDIO = ROOT / "data/librispeech/LibriSpeech/test-clean/4446/2273/4446-2273-0001.flac"
 TRANSCRIPT = "they asked him to come to see them in chelsea"
 SENSEVOICE = ROOT / "models/sensevoice-small"
 QWEN3_ASR = ROOT / "models/qwen3-asr-0.6b"
+WHISPER = ROOT / "models/whisper-tiny"
 
 
 def require(*paths: Path) -> None:
@@ -102,3 +105,68 @@ def test_qwen3_asr_worker_stops(monkeypatch):
     with pytest.raises(RuntimeError, match="the decoding worker has stopped"):
         transcriber.transcribe(AUDIO.read_bytes())
     assert not transcriber.alive
+
+
+def fail_batches_over_one(monkeypatch, transcriber, method: str) -> list[int]:
+    """Make ``method`` run out of memory for batches of more than one window;
+    returns the batch sizes it was called with."""
+    run = getattr(transcriber, method)
+    sizes = []
+
+    def run_one_at_a_time(jobs, *args):
+        sizes.append(len(jobs))
+        if len(jobs) > 1:
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        return run(jobs, *args)
+
+    monkeypatch.setattr(transcriber, method, run_one_at_a_time)
+    return sizes
+
+
+@pytest.mark.parametrize(
+    "path, load, method",
+    [
+        (
+            SENSEVOICE,
+            lambda path: SenseVoiceTranscriber(path, batch_wait_ms=500),
+            "_launch",
+        ),
+        (
+            QWEN3_ASR,
+            lambda path: Qwen3ASRTranscriber(
+                path, cuda_graphs=False, max_batch_size=4, batch_wait_ms=500
+            ),
+            "_encode_audio",
+        ),
+        (
+            WHISPER,
+            lambda path: Transcriber(
+                path,
+                cuda_graphs=False,
+                max_batch_size=4,
+                batch_wait_ms=500,
+                condition_on_previous_text=False,
+            ),
+            "_encode",
+        ),
+    ],
+    ids=["sensevoice", "qwen3-asr", "whisper"],
+)
+def test_out_of_memory_batch_is_retried_in_halves(monkeypatch, path, load, method):
+    """A batch that runs out of memory is split until it fits, so its windows
+    still succeed instead of failing together."""
+    require(path, AUDIO)
+    transcriber = load(path)
+    sizes = fail_batches_over_one(monkeypatch, transcriber, method)
+    # The utterance at the start of each of three 30-second windows; the long
+    # batch wait gathers them into one batch.
+    speech = load_audio(AUDIO.read_bytes())
+    waveform = np.zeros(75 * SAMPLE_RATE, dtype=np.float32)
+    for start in (0, 30, 60):
+        waveform[start * SAMPLE_RATE : start * SAMPLE_RATE + len(speech)] = speech
+    result = transcriber.transcribe(waveform, language="en")
+    assert max(sizes) > 1
+    assert len(result.segments) == 3
+    for segment in result.segments:
+        assert normalized(segment.text).strip().startswith(TRANSCRIPT)
+    assert transcriber.alive

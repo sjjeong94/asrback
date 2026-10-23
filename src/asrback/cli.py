@@ -4,7 +4,12 @@ over the OpenAI audio API."""
 from __future__ import annotations
 
 import argparse
+import sys
+import threading
 from pathlib import Path
+
+# How often the server checks that the model can still serve.
+WATCH_SECONDS = 1.0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -77,16 +82,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-audio-seconds",
         type=float,
-        default=None,
+        default=3600.0,
         help="Reject (400) audio longer than this many seconds, before most of it "
-        "is decoded. Default: no limit",
+        "is decoded; 0 for no limit. Default: 3600",
     )
     parser.add_argument(
         "--max-concurrent-requests",
         type=int,
-        default=None,
+        default=512,
         help="Answer 429 to audio requests while this many are in flight, before "
-        "reading their upload. Default: no limit",
+        "reading their upload; 0 for no limit. Default: 512",
+    )
+    parser.add_argument(
+        "--max-upload-mb",
+        type=float,
+        default=512.0,
+        help="Reject (413) audio uploads larger than this many megabytes "
+        "(2^20 bytes); 0 for no limit. Default: 512",
     )
     parser.add_argument(
         "--model-process",
@@ -102,11 +114,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-batch-size must be greater than zero")
     if args.batch_wait_ms < 0:
         parser.error("--batch-wait-ms must be non-negative")
-    if args.max_audio_seconds is not None and args.max_audio_seconds <= 0:
-        parser.error("--max-audio-seconds must be greater than zero")
-    if args.max_concurrent_requests is not None and args.max_concurrent_requests <= 0:
-        parser.error("--max-concurrent-requests must be greater than zero")
+    for name in ("max_audio_seconds", "max_concurrent_requests", "max_upload_mb"):
+        value = getattr(args, name)
+        if value < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
+        # 0 turns the limit off.
+        setattr(args, name, value or None)
     return args
+
+
+def serve(server, transcriber, watch_seconds: float = WATCH_SECONDS) -> int:
+    """Run the uvicorn ``server`` until it is stopped (exit status 0) or until the
+    model can no longer serve (exit status 1): a stopped decoding worker or model
+    process cannot recover, so the server exits for its supervisor to restart it
+    instead of failing every request."""
+    stopped = threading.Event()
+    failed = threading.Event()
+
+    def watch() -> None:
+        while not stopped.wait(watch_seconds):
+            if not transcriber.alive:
+                print(
+                    "asrback: the model can no longer serve; shutting down",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                failed.set()
+                server.should_exit = True
+                return
+
+    threading.Thread(target=watch, name="asrback-health", daemon=True).start()
+    try:
+        server.run()
+    finally:
+        stopped.set()
+    return 1 if failed.is_set() else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -143,6 +185,11 @@ def main(argv: list[str] | None = None) -> int:
         f"batch {transcriber.max_batch_size}, "
         f"CUDA graphs {'on' if transcriber.cuda_graphs else 'off'}) as {model_name!r}"
     )
-    app = create_app(transcriber, model_name, args.max_concurrent_requests)
-    uvicorn.run(app, host=args.host, port=args.port)
-    return 0
+    max_upload_bytes = (
+        int(args.max_upload_mb * 2**20) if args.max_upload_mb is not None else None
+    )
+    app = create_app(
+        transcriber, model_name, args.max_concurrent_requests, max_upload_bytes
+    )
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port))
+    return serve(server, transcriber)

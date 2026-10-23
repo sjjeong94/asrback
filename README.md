@@ -54,16 +54,25 @@ Endpoints:
 Supported response formats are `json`, `text`, `srt`, `vtt` and `verbose_json`.
 Audio longer than 30 seconds is decoded in 30-second windows.
 
-Two options protect a shared server, and both are off by default:
+Three options protect the server; `0` turns any of them off:
 
-- `--max-audio-seconds N` rejects longer audio with a 400, before most of it is decoded.
-- `--max-concurrent-requests N` answers 429 (`Retry-After: 1`) to audio requests while
-  N are in flight, before reading their upload. OpenAI clients retry a 429 on their own.
+- `--max-audio-seconds N` (default 3600) rejects longer audio with a 400, before most of
+  it is decoded.
+- `--max-concurrent-requests N` (default 512) answers 429 (`Retry-After: 1`) to audio
+  requests while N are in flight, before reading their upload. OpenAI clients retry a
+  429 on their own.
+- `--max-upload-mb N` (default 512) answers 413 to larger uploads, by their
+  `Content-Length` or, for a chunked upload, as soon as it passes the limit.
+
+A batch that runs out of GPU memory is retried in halves until it fits, so one large
+batch does not fail every request in it.
 
 `/health` answers 503 once the model can no longer serve. This happens when the model
 process has exited, or when the decoding worker has stopped after a device error it
-cannot recover from (such as an illegal memory access). Requests then fail with a 500
-instead of waiting, so a supervisor can restart the server.
+cannot recover from (such as an illegal memory access). Requests then fail with a 503
+instead of waiting, and the server shuts down with exit status 1 within a second, so a
+supervisor (systemd `Restart=on-failure`, Kubernetes) can restart it. Other errors
+during decoding answer 500; both use the OpenAI `{"error": {...}}` format.
 
 Concurrent requests are decoded together in batches. Options that affect speed:
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -20,9 +21,11 @@ from .models import (
     SenseVoiceTranscriber,
     Transcriber,
 )
-from .transcription import Transcription
+from .transcription import ModelUnavailableError, Transcription
 
 RESPONSE_FORMATS = ("json", "text", "srt", "verbose_json", "vtt")
+
+logger = logging.getLogger(__name__)
 
 
 class APIError(Exception):
@@ -77,6 +80,66 @@ class ConcurrencyLimit:
             await self.app(scope, receive, send)
         finally:
             self.active -= 1
+
+
+class BodyTooLarge(Exception):
+    pass
+
+
+class BodySizeLimit:
+    """ASGI middleware: answer 413 to an audio request whose body is over
+    ``limit`` bytes, by its ``Content-Length`` before reading it, or once a
+    chunked body passes the limit, so an upload cannot fill memory or disk."""
+
+    def __init__(self, app, limit: int) -> None:
+        self.app = app
+        self.limit = limit
+
+    def _response(self) -> JSONResponse:
+        return error_response(
+            f"The request body is larger than {self.limit} bytes.",
+            413,
+            "file",
+            "invalid_request_error",
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or not scope["path"].startswith("/v1/audio/"):
+            await self.app(scope, receive, send)
+            return
+        for name, value in scope["headers"]:
+            if name == b"content-length" and value.isdigit():
+                if int(value) > self.limit:
+                    await self._response()(scope, receive, send)
+                    return
+        received = 0
+        exceeded = False
+        started = False
+
+        async def limited_receive():
+            nonlocal received, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.limit:
+                    exceeded = True
+                    raise BodyTooLarge
+            return message
+
+        async def guarded_send(message):
+            nonlocal started
+            # The body parser may turn the error into its own response: replace it.
+            if exceeded:
+                return
+            started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, guarded_send)
+        except BodyTooLarge:
+            pass
+        if exceeded and not started:
+            await self._response()(scope, receive, send)
 
 
 def format_timestamp(seconds: float, separator: str) -> str:
@@ -135,9 +198,11 @@ def create_app(
     ),
     model_name: str,
     max_concurrent_requests: int | None = None,
+    max_upload_bytes: int | None = None,
 ) -> FastAPI:
     """Build the app. Requests may name any model; ``model_name`` is what we list.
-    With ``max_concurrent_requests``, audio requests beyond it get a 429."""
+    With ``max_concurrent_requests``, audio requests beyond it get a 429; with
+    ``max_upload_bytes``, audio requests with a larger body get a 413."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -153,6 +218,9 @@ def create_app(
         yield
 
     app = FastAPI(title="asrback", version=__version__, lifespan=lifespan)
+    if max_upload_bytes is not None:
+        app.add_middleware(BodySizeLimit, limit=max_upload_bytes)
+    # Added last, so it runs first: a busy server answers before reading anything.
     if max_concurrent_requests is not None:
         app.add_middleware(ConcurrencyLimit, limit=max_concurrent_requests)
     created = int(time.time())
@@ -189,6 +257,15 @@ def create_app(
             result = transcriber.transcribe(audio, temperature=temperature, **options)
         except ValueError as exc:
             raise APIError(str(exc)) from exc
+        except ModelUnavailableError as exc:
+            raise APIError(str(exc), 503, error_type="server_error") from exc
+        except Exception as exc:
+            logger.exception("Transcription failed")
+            raise APIError(
+                "The server failed to transcribe the audio.",
+                500,
+                error_type="server_error",
+            ) from exc
         return render(result, response_format)
 
     # Plain ``def`` endpoints run in FastAPI's thread pool, keeping the event loop

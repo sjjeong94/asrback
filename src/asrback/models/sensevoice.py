@@ -34,6 +34,7 @@ from ..transcription import (
     gather_batch,
     load_audio,
     raise_if_device_failed,
+    split_on_out_of_memory,
     to_device,
 )
 
@@ -486,14 +487,21 @@ class SenseVoiceTranscriber:
                 except queue.Empty:
                     break
             launched = None
-            if pending:
-                jobs = take_similar(pending, self.max_batch_size)
+            jobs = take_similar(pending, self.max_batch_size) if pending else []
+            while jobs:
                 try:
                     launched = self._launch(jobs)
                 except BaseException as exc:
+                    if split_on_out_of_memory(exc, jobs):
+                        # Launch the older half; the rest goes back to the front.
+                        half = len(jobs) // 2
+                        pending[:0] = jobs[half:]
+                        jobs = jobs[:half]
+                        continue
                     for job in jobs:
                         job.future.set_exception(exc)
                     raise_if_device_failed(self.device)
+                break
             if running is not None:
                 try:
                     results = self._collect(running)

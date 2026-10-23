@@ -149,14 +149,20 @@ Endpoints (`server.py`):
 
 The shared handler `run()`:
 
-0. With `--max-concurrent-requests N`, the `ConcurrencyLimit` middleware has already answered 429
-   (`Retry-After: 1`) if N audio requests were in flight. It runs before the multipart body is read,
-   so rejected uploads cost nothing. Other paths (`/health`, `/v1/models`) are not counted.
+0. With `--max-concurrent-requests N` (default 512), the `ConcurrencyLimit` middleware has already
+   answered 429 (`Retry-After: 1`) if N audio requests were in flight. It runs before the multipart
+   body is read, so rejected uploads cost nothing. Other paths (`/health`, `/v1/models`) are not
+   counted. Next, with `--max-upload-mb N` (default 512), the `BodySizeLimit` middleware answers 413
+   to a body over the limit: by its `Content-Length` before reading it, or, for a chunked body, as
+   soon as the bytes received pass the limit (the response of the interrupted body parser is
+   replaced).
 1. Checks that `response_format` is one of `json`, `text`, `srt`, `vtt`, `verbose_json` and that
    `temperature` is between 0 and 1.
 2. Reads the whole upload into bytes. An empty file is a 400.
 3. Calls `transcriber.transcribe(audio_bytes, temperature=..., language=..., task=..., prompt=...)`,
-   which blocks the request thread until the result is ready.
+   which blocks the request thread until the result is ready. A `ValueError` becomes a 400, a
+   `ModelUnavailableError` (stopped worker or model process) a 503, and any other exception is
+   logged and becomes a 500, all in the OpenAI error format.
 4. Formats the result with `render()` (section [9](#9-responses)).
 
 The endpoints are plain `def`, not `async def`, so the event loop stays responsive while a request
@@ -195,6 +201,10 @@ flowchart LR
   limit of 40, at most 40 requests can wait inside the server, so batches fill less and SenseVoice has
   fewer windows to group by length. The lifespan hook therefore raises the limit to
   `8 × max_batch_size` (at least 40).
+- **Out of memory**: when encoding and prefilling new windows (Whisper, Qwen3-ASR, Gemma 4) or
+  launching a batch (SenseVoice) raises `torch.OutOfMemoryError`, the windows are retried in halves
+  (`transcription.split_on_out_of_memory`) down to one window, so one large batch does not fail every
+  request in it. SenseVoice launches the older half and puts the rest back at the front of its queue.
 - **Errors**: if batched inference raises, the same exception goes into every `Future` of that batch.
   The worker then calls `raise_if_device_failed` (a `torch.cuda.synchronize`). After an error that
   leaves the device usable, such as an out-of-memory, the synchronize succeeds and the worker keeps
@@ -202,9 +212,11 @@ flowchart LR
   again and the worker stops: otherwise every later request would fail on a device that cannot recover.
 - **A stopped worker** (`transcription.Worker`): request threads wait on their `Future` through
   `Worker.wait`, which checks every second (`WAIT_POLL_SECONDS`) that the worker still runs. If the
-  worker has stopped, waiting requests and later ones raise `RuntimeError` (500) instead of waiting
-  forever, and the transcriber's `alive` is false, so `/health` answers 503.
-- **Audio length**: with `--max-audio-seconds`, `transcription.load_audio` passes the limit to
+  worker has stopped, waiting requests and later ones raise `ModelUnavailableError` (503) instead of
+  waiting forever, and the transcriber's `alive` is false, so `/health` answers 503.
+- **Exit on failure**: `cli.serve` checks `alive` every second (`WATCH_SECONDS`). Once the model can
+  no longer serve, it stops uvicorn, and the CLI exits with status 1 for a supervisor to restart it.
+- **Audio length**: with `--max-audio-seconds` (default 3600), `transcription.load_audio` passes the limit to
   `asrfront.load(max_duration=...)`, which raises `ValueError` (400) before most of a long file is
   decoded. A waveform passed as an array is checked by its length.
 
@@ -236,8 +248,8 @@ flowchart LR
   raised by the caller, so they become 400s as before.
 - The model process ignores SIGINT and is a daemon: it stops with the server process, and it exits when
   the pipe closes. It also exits when its decoding worker stops (a watch thread checks `alive` every
-  second), so the server process sees the pipe close. If it dies, pending and later requests fail with `RuntimeError` (500) and `/health`
-  answers 503, so a supervisor can restart the server.
+  second), so the server process sees the pipe close. If it dies, pending and later requests fail
+  with `ModelUnavailableError` (503), `/health` answers 503, and the server exits with status 1.
 - Measured with a lightweight multi-process client on LibriSpeech test-clean (RTX 5060 Ti): SenseVoice
   11.1–11.5 s → 9.4–9.5 s (GPU busy 64% → 77%); whisper-small 60.8 s → 59.3 s (already GPU-bound).
 
@@ -679,9 +691,11 @@ the results.
 | Unknown model id | 404 |
 | Audio longer than `--max-audio-seconds` | `ValueError` from `load_audio` → 400 |
 | More than `--max-concurrent-requests` audio requests in flight | 429 with `Retry-After: 1`, before the upload is read |
-| Exception during batched inference | The same exception reaches every request of that batch (Whisper, Qwen3-ASR, Gemma 4: of every occupied row) and FastAPI answers 500; the worker keeps running if the device is still usable |
-| Device error the CUDA context cannot recover from | The worker stops; waiting and later requests raise `RuntimeError` (500) within a second, and `/health` answers 503 (with `--model-process`, the model process exits) |
-| Model process exited (`--model-process`) | Pending and later requests raise `RuntimeError` (500) |
+| Upload larger than `--max-upload-mb` | 413, by `Content-Length` or once a chunked body passes the limit |
+| Out of memory while admitting new windows | Retried in halves down to one window; only a window that does not fit alone fails (500) |
+| Exception during batched inference | The same exception reaches every request of that batch (Whisper, Qwen3-ASR, Gemma 4: of every occupied row) and is logged; the request answers 500 in the OpenAI format; the worker keeps running if the device is still usable |
+| Device error the CUDA context cannot recover from | The worker stops; waiting and later requests raise `ModelUnavailableError` (503) within a second, `/health` answers 503 (with `--model-process`, the model process exits), and the server exits with status 1 |
+| Model process exited (`--model-process`) | Pending and later requests raise `ModelUnavailableError` (503); the server exits with status 1 |
 
 ## 13. Defaults
 
@@ -696,5 +710,6 @@ the results.
 | Windows | 30 s windows in order, each conditioned on earlier text (`--no-condition-on-previous-text`: all at once) | 30 s windows all at once | 30 s windows all at once | 30 s windows all at once |
 | Batching | continuous: rows join and leave a pool of `max_batch_size` every 4 steps | batches of similar length | continuous, as for Whisper; prompts prefilled packed | continuous, every step; prompts prefilled 8 at a time, padded |
 | Decoding | greedy or temperature sampling | greedy CTC | greedy or temperature sampling, at most 512 new tokens | greedy or temperature sampling, at most 448 new tokens |
-| Server thread limit | max(40, 8 × 16) = 128 | max(40, 8 × 32) = 256 | max(40, 8 × 32) = 256 | max(40, 8 × 32) = 256 |
+| Request limits | 3600 s of audio, 512 MB uploads, 512 requests in flight | same | same | same |
+| Server thread limit | max(40, 8 × 16, 512) = 512 | max(40, 8 × 32, 512) = 512 | max(40, 8 × 64, 512) = 512 | max(40, 8 × 32, 512) = 512 |
 | Eval concurrency | 128 requests from 4 processes | 128 requests from 4 processes | 128 requests from 4 processes | 128 requests from 4 processes |

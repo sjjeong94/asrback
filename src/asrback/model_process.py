@@ -22,7 +22,7 @@ from multiprocessing.connection import Connection
 
 import torch
 
-from .transcription import AudioSource, Transcription
+from .transcription import AudioSource, ModelUnavailableError, Transcription
 
 # Read once from the loaded transcriber and served by the proxy.
 ATTRIBUTES = (
@@ -83,7 +83,7 @@ class ProcessTranscriber:
         future: Future = Future()
         with self._send_lock:
             if self._closed:
-                raise RuntimeError("the model process has exited")
+                raise ModelUnavailableError("the model process has exited")
             request_id = next(self._ids)
             self._futures[request_id] = future
             self._connection.send((request_id, audio, options))
@@ -104,7 +104,7 @@ class ProcessTranscriber:
             self._closed = True
             futures, self._futures = self._futures, {}
         for future in futures.values():
-            future.set_exception(RuntimeError("the model process has exited"))
+            future.set_exception(ModelUnavailableError("the model process has exited"))
 
 
 def _serve(

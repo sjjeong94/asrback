@@ -41,6 +41,7 @@ from ..transcription import (
     gather_batch,
     load_audio,
     raise_if_device_failed,
+    split_on_out_of_memory,
     to_device,
 )
 
@@ -1074,6 +1075,12 @@ class Qwen3ASRTranscriber:
             state.sum_logprobs[slot_rows] = logprob
             state.generated[slot_rows, start] = token
         except BaseException as exc:
+            if split_on_out_of_memory(exc, jobs):
+                self._state.free(torch.tensor(slots, device=self.device))
+                half = len(jobs) // 2
+                self._admit(jobs[:half])
+                self._admit(jobs[half:])
+                return
             for job in jobs:
                 job.future.set_exception(exc)
             raise_if_device_failed(self.device)
